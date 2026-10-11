@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="description" content="You have just finished. A house of two thousand people is about to decide what they think.">
+<title>Ovation</title>
+<style>
+  :root { color-scheme: dark; --ground: #000; --ink: #f3e6cf; --dim: rgba(243, 230, 207, .58); --serif: Didot, "Bodoni 72", "Bodoni MT", "Libre Bodoni", "Playfair Display", Baskerville, "Hoefler Text", "Palatino Linotype", Palatino, Georgia, serif; --text: Baskerville, "Hoefler Text", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; }
+  html, body { margin: 0; height: 100%; background: var(--ground); color: var(--ink); overflow: hidden; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; cursor: default; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; outline: none; }
+  .card { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; text-align: center; padding: 0 16px; transition: opacity .9s ease; }
+  #title h1 { font-family: var(--serif); font-weight: 400; font-size: clamp(34px, 7.2vw, 88px); letter-spacing: .42em; margin: 0 0 0 .42em; line-height: 1; }
+  #title p { font-family: var(--text); font-style: italic; font-size: clamp(15px, 1.9vw, 21px); color: var(--dim); margin: 1.6em 0 0; letter-spacing: .02em; }
+  #title .rule { width: 42px; height: 1px; background: rgba(243, 230, 207, .35); margin-top: 1.8em; }
+  #hint { position: fixed; left: 0; right: 0; bottom: max(26px, calc(env(safe-area-inset-bottom) + 14px)); text-align: center; font-family: var(--text); font-style: italic; font-size: 15px; letter-spacing: .06em; color: rgba(243, 230, 207, .8); text-shadow: 0 1px 8px rgba(0,0,0,.9); pointer-events: none; transition: opacity 1.2s ease; }
+  #hint svg { width: 13px; height: 13px; vertical-align: -2px; margin-right: 7px; opacity: .8; }
+  #end h2 { font-family: var(--text); font-style: italic; font-weight: 400; font-size: clamp(17px, 2.3vw, 26px); color: var(--dim); margin: 0; letter-spacing: .01em; }
+  #end h3 { font-family: var(--text); font-style: italic; font-weight: 400; font-size: clamp(15px, 1.7vw, 19px); color: rgba(243, 230, 207, .78); margin: .9em 0 0; }
+  #end p { font-family: var(--serif); font-size: 11px; letter-spacing: .24em; text-transform: uppercase; color: rgba(243, 230, 207, .34); margin: 1.4em 0 0; font-variant-numeric: lining-nums tabular-nums; }
+  #end p span { white-space: nowrap; } #end p i { font-style: normal; }
+  @media (max-width: 520px) { #end p { display: flex; flex-direction: column; gap: .7em; } #end p i { display: none; } }
+  #end button { pointer-events: auto; margin-top: 2.2em; background: none; border: 1px solid rgba(243, 230, 207, .28); color: var(--ink); font-family: var(--serif); font-size: 13px; letter-spacing: .32em; padding: 1.05em 1.5em 1em 1.82em; border-radius: 999px; cursor: pointer; transition: border-color .3s, background .3s; }
+  #end button:hover, #end button:focus-visible { border-color: rgba(243, 230, 207, .7); background: rgba(243, 230, 207, .06); outline: none; }
+  #fail { font-family: var(--text); font-style: italic; color: var(--dim); }
+  #dbg { position: fixed; left: 8px; top: 6px; font: 11px/1.4 ui-monospace, Menlo, monospace; color: #9f9; white-space: pre; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  @media (prefers-reduced-motion: reduce) { .card, #hint { transition: none; } }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="The view from the stage of an opera house. Tap or press space to bow. Drag or use the arrow keys to walk."></canvas>
+<div class="card" id="title"><h1>OVATION</h1><p>You have just finished.</p><div class="rule"></div></div>
+<div id="hint"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2.5 6h2.5l3.5-3v10l-3.5-3h-2.5z"/><path d="M11 5.5c1 .8 1 4.2 0 5M12.8 3.8c2 1.8 2 6.6 0 8.4"/></svg><span>tap to begin · sound on</span></div>
+<div class="card" id="end" style="opacity:0"><h2>Everyone has gone home.</h2><h3 id="said"></h3><p id="tally"></p><button id="again" type="button">ANOTHER NIGHT</button></div>
+<!--SCRIPT-->
+</body>
+</html>

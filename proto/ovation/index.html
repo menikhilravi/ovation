@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Ovation — prototype</title>
+<style>
+html,body{margin:0;height:100%;background:#050302;overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none}
+canvas{display:block;width:100vw;height:100vh}
+</style></head><body><canvas id="c"></canvas><script src="../../tools/spectro.js"></script>
+<script>
+// ---------- PROTOTYPE: OVATION ----------
+// Model on main thread; claps scheduled ~120 ms ahead to an AudioWorklet that renders each from a bank of
+// synthesised hand-clap grains. Tap/click = bow (hold = deeper). Drag up = "more". Drag down = hush.
+const DEBUG = /debug/.test(location.search);
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+let W, H, DPR;
+function resize() { DPR = Math.min(2, devicePixelRatio || 1); W = cv.width = innerWidth * DPR; H = cv.height = innerHeight * DPR; }
+addEventListener('resize', resize); resize();
+const R = (() => { let s = 12345; return () => { s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; })();
+const gauss = () => { let u = 0; while (!u) u = R(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * R()); };
+
+// ---------- the house ----------
+const P = [];
+// stalls: curved rows fanning away; balconies: 3 horseshoe tiers
+function addPerson(x, y, z, tier) { P.push({ x, y, z, tier, ex: 0, clap: false, th: R() * 6.283, f1: 3.9 + .5 * gauss(), f2: 2.0 + .09 * gauss(), stand: 0, standT: 0, lastClap: -9, flash: 0,
+  bias: gauss() * .15, shy: R(), g: .6 + .8 * R(), bank: (R() * 64) | 0, skin: R(), pan: 0, nextT: 0, leave: 0 }); }
+for (let row = 0; row < 24; row++) {
+  const z = 5.5 + row * 0.95, n = Math.floor(22 + row * 1.6), half = 6.5 + row * .55;
+  for (let k = 0; k < n; k++) { const u = k / (n - 1) - .5; if (Math.abs(u) < .03) continue; const x = u * 2 * half; addPerson(x, row * .13, z + x * x * .012, 0); }
+}
+// balconies: horseshoe tiers wrapping toward the stage
+for (let tier = 1; tier <= 3; tier++) for (let row = 0; row < 2; row++) {
+  const n = 110; const Rz = 25 + row * .9, Rx = 16 + row * .9; const y = 3.2 + tier * 3.1 + row * .5;
+  for (let k = 0; k < n; k++) { const a = (k / (n - 1) - .5) * 2.7; const x = Math.sin(a) * Rx, z = 5 + Math.cos(a) * (Rz - 5) * (a > -1.2 && a < 1.2 ? 1 : 1); if (z < 7) continue; addPerson(x, y, z, tier); }
+}
+const N = P.length;
+for (const p of P) p.pan = Math.max(-1, Math.min(1, p.x / 18));
+// ---------- audio ----------
+let ac = null, node = null, audioT0 = 0;
+const WORKLET = `
+class Claps extends AudioWorkletProcessor {
+  constructor(o) { super(); this.bank = o.processorOptions.bank; this.voices = []; this.q = [];
+    this.port.onmessage = e => { const d = e.data; for (let i = 0; i < d.length; i += 4) this.q.push([d[i], d[i+1], d[i+2], d[i+3]]); this.q.sort((a,b)=>a[0]-b[0]); }; }
+  process(_, outs) { const L = outs[0][0], Rr = outs[0][1]; const n = L.length; const t0 = currentFrame;
+    while (this.q.length && this.q[0][0] < t0 + n) { const [at, b, gl, pan] = this.q.shift(); this.voices.push({ s: this.bank[b|0], i: Math.floor(t0 - at), lg: gl * Math.sqrt((1-pan)/2), rg: gl * Math.sqrt((1+pan)/2) }); }
+    for (let v = this.voices.length - 1; v >= 0; v--) { const o = this.voices[v], s = o.s;
+      for (let k = 0; k < n; k++) { const j = o.i + k; if (j < 0) continue; if (j >= s.length) break; L[k] += s[j] * o.lg; Rr[k] += s[j] * o.rg; }
+      o.i += n; if (o.i >= s.length) this.voices.splice(v, 1); }
+    return true; } }
+registerProcessor('claps', Claps);
+class Rec extends AudioWorkletProcessor { constructor() { super(); this.buf = []; this.port.onmessage = () => { this.port.postMessage(this.buf); this.buf = []; }; }
+  process(ins) { const x = ins[0][0]; if (x) this.buf.push(new Float32Array(x)); return true; } }
+registerProcessor('rec', Rec);`;
+function makeBank(sr) {
+  const bank = [];
+  const bp = (x, fc, Q) => { const w = 2 * Math.PI * fc / sr, al = Math.sin(w) / (2 * Q), a0 = 1 + al, a1 = -2 * Math.cos(w), a2 = 1 - al; let x1 = 0, x2 = 0, y1 = 0, y2 = 0; return x.map(v => { const y = (al * v - al * x2 - a1 * y1 - a2 * y2) / a0; x2 = x1; x1 = v; y2 = y1; y1 = y; return y; }); };
+  for (let b = 0; b < 64; b++) {
+    const cup = R(), fc = 2400 * Math.pow(.3, cup) * (.85 + .3 * R()), Q = 1.4 + 4.5 * cup + R(), tau = (.0035 + .008 * cup + .003 * R()) * sr;
+    const L = Math.floor(.06 * sr), n = new Float32Array(L); for (let i = 0; i < L; i++) n[i] = gauss() * Math.min(1, i / (.0004 * sr)) * Math.exp(-i / tau);
+    const y = bp(n, fc, Q); let hpv = 0, px = 0, pk = 0; const a = Math.exp(-2 * Math.PI * 2500 / sr);
+    for (let i = 0; i < L; i++) { hpv = a * (hpv + n[i] - px); px = n[i]; y[i] += hpv * .3 * Math.exp(-i / (.0012 * sr)); pk = Math.max(pk, Math.abs(y[i])); }
+    for (let i = 0; i < L; i++) y[i] /= pk; bank.push(y);
+  }
+  return bank;
+}
+function hallIR(ctx) {
+  const sr = ctx.sampleRate, len = Math.floor(2.4 * sr), b = ctx.createBuffer(2, len, sr);
+  for (let ch = 0; ch < 2; ch++) { const d = b.getChannelData(ch); let lp = 0;
+    for (let i = 0; i < len; i++) { const t = i / sr; const k = .92 - .75 * Math.min(1, t / 1.8); lp += (gauss() - lp) * k; d[i] = t < .015 ? 0 : lp * Math.exp(-6.9 * t / 1.9) * .5; }
+    for (let r = 0; r < 18; r++) { const at = Math.floor((.015 + .09 * R()) * sr); d[at] += (R() < .5 ? -1 : 1) * .5 * (1 - r / 18); } }
+  return b;
+}
+let murmur = null, master = null;
+async function startAudio() {
+  if (ac) return; ac = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+  await ac.audioWorklet.addModule(url);
+  node = new AudioWorkletNode(ac, 'claps', { numberOfInputs: 0, outputChannelCount: [2], processorOptions: { bank: makeBank(ac.sampleRate) } });
+  master = ac.createGain(); master.gain.value = .5;
+  const conv = ac.createConvolver(); conv.buffer = hallIR(ac); const wet = ac.createGain(); wet.gain.value = .55; const dry = ac.createGain(); dry.gain.value = .5;
+  const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 7000;
+  node.connect(lp); lp.connect(dry).connect(master); lp.connect(conv).connect(wet).connect(master); master.connect(ac.destination);
+  if (DEBUG) { const rec = new AudioWorkletNode(ac, 'rec'); master.connect(rec); window.__rec = () => new Promise(r => { rec.port.onmessage = e => { const a = e.data, n = a.reduce((s, b) => s + b.length, 0), o = new Float32Array(n); let k = 0; for (const b of a) { o.set(b, k); k += b.length; } r(o); }; rec.port.postMessage(0); }); }
+  // murmur: brown-ish noise through a vowel-ish bandpass, amplitude-modulated
+  const nb = ac.createBuffer(1, ac.sampleRate * 4, ac.sampleRate), nd = nb.getChannelData(0); let br = 0; for (let i = 0; i < nd.length; i++) { br = br * .985 + gauss() * .1; nd[i] = br; }
+  const ns = ac.createBufferSource(); ns.buffer = nb; ns.loop = true; const f1 = ac.createBiquadFilter(); f1.type = 'bandpass'; f1.frequency.value = 450; f1.Q.value = .8;
+  murmur = ac.createGain(); murmur.gain.value = 0; ns.connect(f1).connect(murmur); murmur.connect(conv); murmur.connect(dry); ns.start();
+  audioT0 = ac.currentTime - now();
+}
+// ---------- model ----------
+const S = { first: 0, emptyT: 0, left: 0, heat: 0, bowing: 0, bowDepth: 0, lastBow: -99, more: 0, hush: 0, mode2: 0, fatigue: 0, clapFrac: 0, t: 0, standFrac: 0, sync: 0, bows: 0 };
+const now = () => performance.now() / 1000;
+let schedUntil = now() + .05;
+function step(dt) {
+  S.t += dt;
+  // the performance has just ended: after a held breath, one person starts, and it spreads
+  if (!S.first && S.t > 2.2) { S.first = 1; const p = P[40 + ((R() * 200) | 0)]; p.clap = true; p.bias += .6; S.heat = .5; }
+  // nobody clapping for a while -> the house begins to leave
+  if (S.first && S.clapFrac < .01 && S.heat < .08) S.emptyT += dt; else S.emptyT = Math.max(0, S.emptyT - dt * 3);
+  // stimulus from bowing
+  const bowStim = S.bowing ? .9 * S.bowDepth : 0;
+  const hab = 1 / (1 + S.fatigue * 1.2);
+  S.heat += (bowStim * hab * 1.4 + S.more * .6 * hab - S.hush * 1.5) * dt;
+  S.heat -= (.035 + .05 * S.heat * S.heat) * dt;          // cools
+  S.heat = Math.max(0, Math.min(1.4, S.heat));
+  S.fatigue = Math.max(0, S.fatigue + (S.bowing ? .12 : -.015) * dt);
+  // rhythmic mode: sustained heat without new stimulus -> period doubling; "more" breaks it
+  const calm = S.bowing || S.more > .1 ? 0 : 1;
+  S.mode2 += ((calm && S.heat > .45 && S.clapFrac > .6 ? .09 : -.5 * (S.more + (S.bowing ? .6 : 0))) - .01) * dt;
+  S.mode2 = Math.max(0, Math.min(1, S.mode2));
+  let nc = 0, ns = 0, sx = 0, sy = 0;
+  for (const p of P) if (p.clap) { nc++; sx += Math.cos(p.th); sy += Math.sin(p.th); }
+  S.clapFrac = nc / N; const Rm = nc ? Math.hypot(sx, sy) / nc : 0, Psi = Math.atan2(sy, sx); S.sync = Rm;
+  for (const p of P) {
+    const want = S.heat + p.bias;
+    if (S.emptyT > 5 && !p.leave && R() < .025 * dt * (1 + S.left * 8)) { p.leave = 1e-3; S.left += 1 / N; }
+    if (p.leave) { p.leave = Math.min(1, p.leave + dt * .5); p.clap = false; p.stand = 1; continue; }
+    if (!p.clap) { const rate = Math.max(0, want - .15) * (.6 + 5 * S.clapFrac) * (1 - S.hush); if (R() < rate * dt) { p.clap = true; p.th = Psi + (R() - .5) * 6; } }
+    else { const rate = Math.max(0, .35 - want) * 2 + (1 - S.clapFrac) * .15 * (want < .5) + S.hush * 3; if (R() < rate * dt) p.clap = false; }
+    // stand: front people visible to those behind -> neighbours matter
+    const st = S.heat > .75 && S.clapFrac > .7 ? (S.standFrac * 1.5 + (S.heat - .75)) * .5 : 0;
+    if (!p.stand && R() < st * dt * (1 + p.bias * 3)) p.stand = 1;
+    if (p.stand && S.heat < .35 && R() < .4 * dt) p.stand = 0;
+    p.standT += ((p.stand ? 1 : 0) - p.standT) * Math.min(1, dt * 4);
+    if (p.stand) ns++;
+    const f = p.f1 * (1 - S.mode2) + p.f2 * S.mode2 + S.more * .4;
+    const K = 7 * S.mode2 * S.mode2 + .6;
+    p.th += (2 * Math.PI * f + (p.clap ? K * Rm * Math.sin(Psi - p.th) : 0)) * dt;
+  }
+  S.standFrac = ns / N;
+}
+// schedule claps whose phase crosses 2π in the next window; send to worklet
+function schedule() {
+  if (!node) return;
+  const out = []; const tNow = now();
+  // predictive: for each clapping person, if next clap time falls in [schedUntil, tNow+.12] queue it
+  const horizon = tNow + .12;
+  for (let i = 0; i < N; i++) { const p = P[i]; if (!p.clap) { p.nextT = 0; continue; }
+    const f = p.f1 * (1 - S.mode2) + p.f2 * S.mode2 + S.more * .4;
+    const phase = ((p.th % 6.283) + 6.283) % 6.283; let tc = tNow + (6.283 - phase) / (6.283 * f);
+    if (tc < p.nextT + .6 / f) continue; // already scheduled this clap
+    if (tc <= horizon) { p.nextT = tc; p.lastClap = tc;
+      const dist = Math.hypot(p.x, p.y, p.z); const gain = p.g / (1 + dist * .12) * .09 * (S.mode2 > .5 ? 1.35 : 1);
+      out.push((tc + audioT0) * ac.sampleRate, p.bank, gain, p.pan); }
+  }
+  if (out.length) node.port.postMessage(new Float32Array(out));
+  if (murmur) murmur.gain.setTargetAtTime(S.t < 1 ? 0 : (.02 + .05 * (1 - Math.min(1, S.clapFrac * 3))) * (1 - S.hush) * (S.heat < .05 ? 1 : .3), ac.currentTime, .3);
+}
+// ---------- render ----------
+const CAM = { y: 2.9, pitch: -.1 };
+function project(x, y, z) {
+  const dy = y - CAM.y, cp = Math.cos(CAM.pitch), sp = Math.sin(CAM.pitch);
+  const zc = z * cp - dy * sp + .5, yc = z * sp + dy * cp; const f = (W / 2) / Math.tan(40 * Math.PI / 180);
+  return [W / 2 + x / zc * f, H * .5 - yc / zc * f, zc];
+}
+S.bowDepthVis = 0;
+const order = P.map((_, i) => i).sort((a, b) => P[b].z - P[a].z);
+function draw(t) {
+  g.fillStyle = '#060403'; g.fillRect(0, 0, W, H);
+  // back wall glow + tiers
+  const grd = g.createRadialGradient(W / 2, H * .45, 0, W / 2, H * .45, W * .7); grd.addColorStop(0, 'rgba(60,34,18,0.55)'); grd.addColorStop(1, 'rgba(0,0,0,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, W, H);
+  for (let tier = 1; tier <= 3; tier++) { g.strokeStyle = `rgba(210,160,90,${.18 + .05 * tier})`; g.lineWidth = 2 * DPR; g.beginPath();
+    let first = true; for (let k = 0; k <= 80; k++) { const a = (k / 80 - .5) * 2.7; const x = Math.sin(a) * 15.2, z = 5 + Math.cos(a) * 19.2; if (z < 7) continue; const [sx, sy] = project(x, 3.2 + tier * 3.1 - .15, z); first ? g.moveTo(sx, sy) : g.lineTo(sx, sy); first = false; } g.stroke(); }
+  const tn = now();
+  for (const i of order) { const p = P[i];
+    const [sx, sy, cz] = project(p.x, p.y + 1.15 + p.standT * .5, p.z); const s = (W / 2) / Math.tan(40 * Math.PI / 180) * .36 / cz;
+    const light = Math.max(.06, 1.3 / (1 + cz * .11)) * (.65 + .35 * p.skin);
+    if (p.leave >= 1) continue;
+    const fade = 1 - (p.leave || 0);
+    g.globalAlpha = fade;
+    // body: shoulders + torso
+    g.fillStyle = `rgb(${34 * light | 0},${22 * light | 0},${18 * light | 0})`;
+    g.beginPath(); g.moveTo(sx - s * .48, sy + s * 1.6); g.bezierCurveTo(sx - s * .5, sy + s * .45, sx - s * .35, sy + s * .32, sx, sy + s * .3);
+    g.bezierCurveTo(sx + s * .35, sy + s * .32, sx + s * .5, sy + s * .45, sx + s * .48, sy + s * 1.6); g.fill();
+    // head (face catches the stage light)
+    g.fillStyle = `rgb(${190 * light | 0},${140 * light | 0},${112 * light | 0})`;
+    g.beginPath(); g.ellipse(sx, sy, s * .15, s * .19, 0, 0, 7); g.fill();
+    g.fillStyle = `rgb(${30 * light | 0},${20 * light | 0},${16 * light | 0})`;
+    g.beginPath(); g.ellipse(sx, sy - s * .08, s * .16, s * .13, 0, Math.PI, 0); g.fill();
+    // hands
+    const since = tn - p.lastClap;
+    if (p.clap) { const ph = ((p.th % 6.283) + 6.283) % 6.283; const sep = s * .13 * Math.sin(ph / 2); const hy = sy + s * (.62 - .12 * p.standT);
+      g.fillStyle = `rgb(${200 * light | 0},${150 * light | 0},${120 * light | 0})`;
+      g.beginPath(); g.arc(sx - sep - s * .04, hy, s * .065, 0, 7); g.arc(sx + sep + s * .04, hy, s * .065, 0, 7); g.fill();
+      if (since >= 0 && since < .1) { const a = 1 - since / .1; g.globalCompositeOperation = 'lighter'; g.fillStyle = `rgba(255,214,160,${a * Math.min(1, .3 + light) * fade})`;
+        g.beginPath(); g.arc(sx, hy, Math.max(1.2 * DPR, s * (.1 + .14 * a)), 0, 7); g.fill(); g.globalCompositeOperation = 'source-over'; } }
+    g.globalAlpha = 1;
+  }
+  // spotlight fades up at the start
+  const up = Math.min(1, S.t / 1.6);
+  // stage lip + spotlight + your shadow
+  S.bowDepthVis += ((S.bowing ? S.bowDepth : 0) - S.bowDepthVis) * .12;
+  const lip = H * .86; const sg = g.createLinearGradient(0, lip, 0, H); sg.addColorStop(0, '#3a2414'); sg.addColorStop(1, '#120b06'); g.fillStyle = sg; g.fillRect(0, lip, W, H - lip);
+  const spot = g.createRadialGradient(W / 2, H * 1.02, 0, W / 2, H * 1.02, H * .3); spot.addColorStop(0, `rgba(255,230,190,${.55 * up})`); spot.addColorStop(1, 'rgba(255,230,190,0)'); g.fillStyle = spot; g.fillRect(0, lip, W, H - lip);
+  // shadow: a figure silhouette cast forward toward the house, bends when bowing
+  const b = S.bowDepthVis; g.fillStyle = 'rgba(0,0,0,.75)'; g.save(); g.translate(W / 2, H * 1.0); g.scale(1, .35);
+  g.beginPath(); g.ellipse(0, -H * .18 * (1 - b * .35), H * .05, H * .2 * (1 - b * .35), 0, 0, 7); g.fill();
+  g.beginPath(); g.arc(0, -H * .4 * (1 - b * .55), H * .045, 0, 7); g.fill(); g.restore();
+  g.fillStyle = 'rgba(255,255,255,.35)'; g.font = `${11 * DPR}px ui-monospace,monospace`;
+  if (DEBUG) g.fillText(`t ${S.t.toFixed(1)} left ${(S.left*100).toFixed(0)}% heat ${S.heat.toFixed(2)} clap ${(S.clapFrac * 100).toFixed(0)}% sync ${S.sync.toFixed(2)} mode2 ${S.mode2.toFixed(2)} stand ${(S.standFrac * 100).toFixed(0)}% N ${N}`, 10 * DPR, 18 * DPR);
+}
+
+// ---------- input ----------
+let down = null;
+cv.addEventListener('pointerdown', e => { startAudio(); down = { x: e.clientX, y: e.clientY, t: now() }; S.bowing = 1; S.bowDepth = .4; S.bows++; });
+cv.addEventListener('pointermove', e => { if (!down) return; const dy = (e.clientY - down.y) / innerHeight; if (Math.abs(dy) > .04) { S.bowing = 0; S.more = Math.max(0, -dy * 2.5); S.hush = Math.max(0, dy * 2.5); } });
+addEventListener('pointerup', () => { down = null; S.bowing = 0; S.more = 0; S.hush = 0; });
+window.__S = S;
+let last = now();
+(function loop() { const t = now(); let dt = Math.min(.05, t - last); last = t;
+  if (S.bowing) S.bowDepth = Math.min(1, S.bowDepth + dt * .8);
+  const sub = 4; for (let k = 0; k < sub; k++) step(dt / sub);
+  schedule(); draw(t); requestAnimationFrame(loop); })();
+</script></body></html>

@@ -1,0 +1,1957 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<meta name="description" content="You have just finished. A house of two thousand people is about to decide what they think.">
+<title>Ovation</title>
+<style>
+  :root { color-scheme: dark; --ground: #000; --ink: #f3e6cf; --dim: rgba(243, 230, 207, .58); --serif: Didot, "Bodoni 72", "Bodoni MT", "Libre Bodoni", "Playfair Display", Baskerville, "Hoefler Text", "Palatino Linotype", Palatino, Georgia, serif; --text: Baskerville, "Hoefler Text", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif; }
+  html, body { margin: 0; height: 100%; background: var(--ground); color: var(--ink); overflow: hidden; }
+  body { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; cursor: default; }
+  canvas { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: block; outline: none; }
+  .card { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: none; text-align: center; padding: 0 16px; transition: opacity .9s ease; }
+  #title h1 { font-family: var(--serif); font-weight: 400; font-size: clamp(34px, 7.2vw, 88px); letter-spacing: .42em; margin: 0 0 0 .42em; line-height: 1; }
+  #title p { font-family: var(--text); font-style: italic; font-size: clamp(15px, 1.9vw, 21px); color: var(--dim); margin: 1.6em 0 0; letter-spacing: .02em; }
+  #title .rule { width: 42px; height: 1px; background: rgba(243, 230, 207, .35); margin-top: 1.8em; }
+  #hint { position: fixed; left: 0; right: 0; bottom: max(26px, calc(env(safe-area-inset-bottom) + 14px)); text-align: center; font-family: var(--text); font-style: italic; font-size: 15px; letter-spacing: .06em; color: rgba(243, 230, 207, .8); text-shadow: 0 1px 8px rgba(0,0,0,.9); pointer-events: none; transition: opacity 1.2s ease; }
+  #hint svg { width: 13px; height: 13px; vertical-align: -2px; margin-right: 7px; opacity: .8; }
+  #end h2 { font-family: var(--text); font-style: italic; font-weight: 400; font-size: clamp(17px, 2.3vw, 26px); color: var(--dim); margin: 0; letter-spacing: .01em; }
+  #end h3 { font-family: var(--text); font-style: italic; font-weight: 400; font-size: clamp(15px, 1.7vw, 19px); color: rgba(243, 230, 207, .78); margin: .9em 0 0; }
+  #end p { font-family: var(--serif); font-size: 11px; letter-spacing: .24em; text-transform: uppercase; color: rgba(243, 230, 207, .34); margin: 1.4em 0 0; font-variant-numeric: lining-nums tabular-nums; }
+  #end p span { white-space: nowrap; } #end p i { font-style: normal; }
+  @media (max-width: 520px) { #end p { display: flex; flex-direction: column; gap: .7em; } #end p i { display: none; } }
+  #end button { pointer-events: auto; margin-top: 2.2em; background: none; border: 1px solid rgba(243, 230, 207, .28); color: var(--ink); font-family: var(--serif); font-size: 13px; letter-spacing: .32em; padding: 1.05em 1.5em 1em 1.82em; border-radius: 999px; cursor: pointer; transition: border-color .3s, background .3s; }
+  #end button:hover, #end button:focus-visible { border-color: rgba(243, 230, 207, .7); background: rgba(243, 230, 207, .06); outline: none; }
+  #fail { font-family: var(--text); font-style: italic; color: var(--dim); }
+  #dbg { position: fixed; left: 8px; top: 6px; font: 11px/1.4 ui-monospace, Menlo, monospace; color: #9f9; white-space: pre; pointer-events: none; text-shadow: 0 1px 2px #000; }
+  @media (prefers-reduced-motion: reduce) { .card, #hint { transition: none; } }
+</style>
+</head>
+<body>
+<canvas id="c" tabindex="0" aria-label="The view from the stage of an opera house. Tap or press space to bow. Drag or use the arrow keys to walk."></canvas>
+<div class="card" id="title"><h1>OVATION</h1><p>You have just finished.</p><div class="rule"></div></div>
+<div id="hint"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M2.5 6h2.5l3.5-3v10l-3.5-3h-2.5z"/><path d="M11 5.5c1 .8 1 4.2 0 5M12.8 3.8c2 1.8 2 6.6 0 8.4"/></svg><span>tap to begin · sound on</span></div>
+<div class="card" id="end" style="opacity:0"><h2>Everyone has gone home.</h2><h3 id="said"></h3><p id="tally"></p><button id="again" type="button">ANOTHER NIGHT</button></div>
+<script>
+(() => {
+'use strict';
+const WORKLET_SRC = "// worklet.js — runs on the audio thread. Every sound is a pre-synthesised grain written *ahead* into ring buffers at\n// its exact sample: crowd sounds into one mono ring per zone of the house (each zone then gets air absorption and a\n// pan relative to where the performer stands), everything else into stereo rings. Two outputs: dry, and a send for\n// the hall's convolution reverb. The same class also runs on the main thread inside a ScriptProcessor where\n// AudioWorklet is unavailable, so it keeps its own sample clock (this.frame) instead of reading worklet globals.\nconst RING = 1 << 18; // ~5.4 s at 48 kHz\nconst MASK = RING - 1;\n\nclass House extends AudioWorkletProcessor {\n  constructor(opts) {\n    super();\n    const o = opts.processorOptions;\n    this.banks = o.banks;                  // { name: [Float32Array, ...] }\n    this.nz = o.zones;\n    this.zbuf = []; this.z = [];\n    for (let k = 0; k < this.nz; k++) {\n      this.zbuf.push(new Float32Array(RING));\n      this.z.push({ gl: 0, gr: 0, tgl: 0, tgr: 0, a: 0.5, s1: 0, s2: 0, send: 0.4, tsend: 0.4 });\n    }\n    this.fx = [new Float32Array(RING), new Float32Array(RING)];\n    this.fxs = [new Float32Array(RING), new Float32Array(RING)];\n    this.room = 0; this.troom = 0; this.mur = 0; this.tmur = 0; this.muf = 0; this.cheer = 0; this.tcheer = 0;\n    this.n1 = 0; this.n2 = 0; this.b = 0;\n    this.talk = Array.from({ length: 10 }, (_, i) => ({ ph: Math.random() * 6.28, f: 2.5 + Math.random() * 3, lp1: 0, lp2: 0, bp: 0, fc: 0.04 + 0.05 * Math.random(), pan: Math.random() * 2 - 1, amp: 0 }));\n    this.seed = 1234567; this.frame = 0; this.lastN = 128;\n    if (this.port) this.port.onmessage = (e) => this.msg(e.data);\n  }\n  rnd() { this.seed = (this.seed * 1664525 + 1013904223) >>> 0; return this.seed / 4294967296 * 2 - 1; }\n  msg(d) {\n    if (d.type === 'ev') {\n      const a = d.data, names = d.names;\n      for (let i = 0; i < a.length; i += 6) {\n        const frame = Math.round(a[i]), bank = this.banks[names[a[i + 1] | 0]], g = a[i + 4];\n        if (!bank) continue;\n        const buf = bank[(a[i + 2] | 0) % bank.length], zone = a[i + 3] | 0;\n        const now = this.frame + this.lastN;\n        let start = frame - now, k0 = 0;\n        if (start < 0) { if (start < -0.04 * sampleRate) continue; start = 0; }   // a little late: play it whole, now\n        if (start + buf.length > RING - 256) continue;\n        const w0 = now + start;\n        if (zone >= 0) {\n          const zb = this.zbuf[zone];\n          for (let k = k0; k < buf.length; k++) zb[(w0 + k - k0) & MASK] += buf[k] * g;\n        } else {\n          const pan = a[i + 5], gl = g * Math.sqrt((1 - pan) / 2), gr = g * Math.sqrt((1 + pan) / 2), s = a[i + 3] === -2 ? 0.25 : 0.55;\n          const L = this.fx[0], R = this.fx[1], SL = this.fxs[0], SR = this.fxs[1];\n          for (let k = k0; k < buf.length; k++) { const j = (w0 + k - k0) & MASK, v = buf[k]; L[j] += v * gl; R[j] += v * gr; SL[j] += v * gl * s; SR[j] += v * gr * s; }\n        }\n      }\n    } else if (d.type === 'zones') {\n      const a = d.data;\n      for (let k = 0; k < this.nz; k++) { const z = this.z[k]; z.tgl = a[k * 4]; z.tgr = a[k * 4 + 1]; z.a = a[k * 4 + 2]; z.tsend = a[k * 4 + 3]; }\n    } else if (d.type === 'amb') { this.troom = d.room; this.tmur = d.murmur; if (d.cheer != null) this.tcheer = d.cheer; }\n  }\n  process(_, outs) {\n    const dry = outs[0], send = outs[1];\n    if (typeof currentFrame !== 'undefined') this.frame = currentFrame;\n    const L = dry[0], R = dry[1], SL = send[0], SR = send[1], n = L.length, f0 = this.frame; this.lastN = n;\n    for (let k = 0; k < this.nz; k++) {\n      const z = this.z[k], zb = this.zbuf[k], a = z.a;\n      let s1 = z.s1, s2 = z.s2, gl = z.gl, gr = z.gr, sd = z.send; const dgl = (z.tgl - gl) / n, dgr = (z.tgr - gr) / n, dsd = (z.tsend - sd) / n;\n      for (let i = 0; i < n; i++) {\n        const j = (f0 + i) & MASK, v = zb[j]; zb[j] = 0;\n        s1 = v + (s1 - v) * a; s2 = s1 + (s2 - s1) * a;\n        gl += dgl; gr += dgr; sd += dsd;\n        L[i] += s2 * gl; R[i] += s2 * gr; const w = s2 * sd; SL[i] += w; SR[i] += w;\n      }\n      z.s1 = s1; z.s2 = s2; z.gl = gl; z.gr = gr; z.send = sd;\n    }\n    const FL = this.fx[0], FR = this.fx[1], XL = this.fxs[0], XR = this.fxs[1];\n    for (let i = 0; i < n; i++) { const j = (f0 + i) & MASK; L[i] += FL[j]; R[i] += FR[j]; SL[i] += XL[j]; SR[i] += XR[j]; FL[j] = 0; FR[j] = 0; XL[j] = 0; XR[j] = 0; }\n    // room tone (air handling, a big quiet space) and the murmur of a waiting or departing audience\n    this.room += (this.troom - this.room) * 0.002; this.mur += (this.tmur - this.mur) * 0.001;\n    if (this.room > 1e-5 || this.mur > 1e-5) {\n      for (let i = 0; i < n; i++) {\n        const w = this.rnd();\n        this.b = this.b * 0.997 + w * 0.03; this.n1 = this.n1 * 0.9 + w * 0.1;\n        const rt = (this.b * 1.4 + this.n1 * 0.08) * this.room;\n        L[i] += rt; R[i] += rt * 0.96; SL[i] += rt * 0.3; SR[i] += rt * 0.3;\n      }\n      if (this.mur > 1e-5) {\n        for (const tk of this.talk) {\n          const df = tk.f / sampleRate * 6.2832;\n          for (let i = 0; i < n; i++) {\n            tk.ph += df * (1 + 0.3 * Math.sin(tk.ph * 0.37));\n            const syl = Math.max(0, Math.sin(tk.ph)) ** 2 * (0.6 + 0.4 * Math.sin(tk.ph * 0.13));\n            const w = this.rnd();\n            tk.lp1 += (w - tk.lp1) * tk.fc * 3; tk.lp2 += (tk.lp1 - tk.lp2) * tk.fc * 1.5;\n            const v = (tk.lp1 - tk.lp2) * syl * this.mur * 0.9;\n            L[i] += v * (1 - tk.pan) * 0.3; R[i] += v * (1 + tk.pan) * 0.3; SL[i] += v * 0.8; SR[i] += v * 0.8;\n          }\n        }\n      }\n    }\n    return true;\n  }\n}\nregisterProcessor('house', House);\n";
+// ───────── util.js ─────────
+// util.js — small maths, randomness and matrices. Everything shares one scope (see tools/build.mjs).
+
+const TAU = Math.PI * 2;
+const clamp = (x, a, b) => x < a ? a : x > b ? b : x;
+const lerp = (a, b, t) => a + (b - a) * t;
+const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const approach = (x, target, rate, dt) => x + (target - x) * (1 - Math.exp(-rate * dt));
+
+function makeRng(seed) {
+  let s = seed | 0;
+  const r = () => { s = s + 0x6D2B79F5 | 0; let t = Math.imul(s ^ s >>> 15, 1 | s); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+  r.gauss = () => { let u = 0; while (!u) u = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * r()); };
+  r.range = (a, b) => a + (b - a) * r();
+  r.pick = arr => arr[(r() * arr.length) | 0];
+  return r;
+}
+
+// Column-major 4×4 matrices as Float32Array(16).
+const M4 = {
+  perspective(fovy, aspect, near, far) {
+    const f = 1 / Math.tan(fovy / 2), nf = 1 / (near - far), m = new Float32Array(16);
+    m[0] = f / aspect; m[5] = f; m[10] = (far + near) * nf; m[11] = -1; m[14] = 2 * far * near * nf; return m;
+  },
+  lookAt(eye, at, up) {
+    let zx = eye[0] - at[0], zy = eye[1] - at[1], zz = eye[2] - at[2]; let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+    let xx = up[1] * zz - up[2] * zy, xy = up[2] * zx - up[0] * zz, xz = up[0] * zy - up[1] * zx; l = Math.hypot(xx, xy, xz); xx /= l; xy /= l; xz /= l;
+    const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+    const m = new Float32Array(16);
+    m[0] = xx; m[1] = yx; m[2] = zx; m[4] = xy; m[5] = yy; m[6] = zy; m[8] = xz; m[9] = yz; m[10] = zz;
+    m[12] = -(xx * eye[0] + xy * eye[1] + xz * eye[2]); m[13] = -(yx * eye[0] + yy * eye[1] + yz * eye[2]); m[14] = -(zx * eye[0] + zy * eye[1] + zz * eye[2]); m[15] = 1;
+    return m;
+  },
+  mul(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+      o[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+    }
+    return o;
+  },
+  // project a world point with a view-projection matrix → [ndcX, ndcY, w]
+  project(m, x, y, z) {
+    const X = m[0] * x + m[4] * y + m[8] * z + m[12], Y = m[1] * x + m[5] * y + m[9] * z + m[13], W = m[3] * x + m[7] * y + m[11] * z + m[15];
+    return [X / W, Y / W, W];
+  },
+};
+
+// ───────── house.js ─────────
+// house.js — the venue: an Italianate horseshoe opera house seen from its stage.
+// Units are metres. x → performer's right, y ↑, z → away from the stage into the house.
+// The stalls floor at the front row is y = 0; the stage floor is y = STAGE_Y; the stage edge is z = 0.
+
+const STAGE_Y = 1.15;
+const EYE = 1.66;                 // performer's eye height above the stage
+const PERF_Z = -3.4;              // where the performer stands (upstage of the edge)
+const PIT_Z = 2.9;                // orchestra pit between the stage edge and the front row
+const WING_X = 7.4;               // |x| beyond which the performer is in the wings
+const HOUSE = {
+  tiers: [4.5, 7.5, 10.5, 13.5],  // parapet top heights (above the stalls floor)
+  sideX: 12.4, sideZ0: 3.4, backCz: 12.5, backA: 12.4, backB: 15.2,
+  ceilingY: 17.2, chandelier: [0, 14.2, 14.8], booth: [0, 15.6, 29.2],
+};
+
+// The horseshoe plan curve, sampled as a polyline from the left proscenium end, round the back, to the right.
+function horseshoeCurve(offset) {
+  const pts = [];
+  const { sideX, sideZ0, backCz, backA, backB } = HOUSE;
+  const a = backA + offset, b = backB + offset, sx = sideX + offset;
+  for (let z = sideZ0; z < backCz; z += 0.25) pts.push([-sx, z]);
+  for (let i = 0; i <= 160; i++) { const th = -Math.PI / 2 + Math.PI * i / 160; pts.push([Math.sin(th) * a, backCz + Math.cos(th) * b]); }
+  for (let z = backCz - 0.25; z >= sideZ0; z -= 0.25) pts.push([sx, z]);
+  // cumulative arc length and inward normals (pointing into the house)
+  const len = [0];
+  for (let i = 1; i < pts.length; i++) len.push(len[i - 1] + Math.hypot(pts[i][0] - pts[i - 1][0], pts[i][1] - pts[i - 1][1]));
+  const at = (s) => { // s in metres along the curve
+    s = clamp(s, 0, len[len.length - 1]);
+    let lo = 0, hi = len.length - 1; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (len[m] < s) lo = m; else hi = m; }
+    const t = (s - len[lo]) / Math.max(1e-6, len[hi] - len[lo]);
+    const x = lerp(pts[lo][0], pts[hi][0], t), z = lerp(pts[lo][1], pts[hi][1], t);
+    let tx = pts[hi][0] - pts[lo][0], tz = pts[hi][1] - pts[lo][1]; const l = Math.hypot(tx, tz) || 1; tx /= l; tz /= l;
+    return { x, z, nx: tz, nz: -tx, tx, tz }; // (nx,nz) points inward, into the house, for this winding
+  };
+  return { pts, length: len[len.length - 1], at };
+}
+
+function buildHouse(seed) {
+  const rng = makeRng(seed);
+  const seats = [];   // every seat, occupied or not: {x,y,z, face:[fx,fz], tier, row, box, occupied, person}
+  // ── stalls: shallow-raked rows on arcs centred behind the stage, split by two aisles
+  for (let r = 0; r < 21; r++) {
+    const z0 = 3.9 + r * 0.96, y = r * 0.105, R = z0 + 56;
+    const halfW = Math.min(11.3, 6.6 + r * 0.3);
+    const n = Math.floor(halfW * 2 / 0.56);
+    for (let k = 0; k < n; k++) {
+      const x0 = -halfW + (k + .5) * (halfW * 2 / n);
+      if (Math.abs(Math.abs(x0) - 4.0) < 0.5) continue;              // aisles
+      const a = Math.asin(clamp(x0 / R, -1, 1)), x = Math.sin(a) * R, z = -56 + Math.cos(a) * R;
+      seats.push({ x, y, z, fx: -Math.sin(a), fz: -Math.cos(a), tier: 0, row: r, box: 0 });
+    }
+  }
+  // ── horseshoe tiers: parapet, then rows stepping up and back; the sides are divided into boxes
+  HOUSE.tiers.forEach((top, ti) => {
+    const rows = ti === 3 ? 4 : 3, rise = ti === 3 ? 0.55 : 0.38;
+    for (let r = 0; r < rows; r++) {
+      const c = horseshoeCurve(0.55 + r * 0.86);
+      const pitch = 0.6, n = Math.floor(c.length / pitch);
+      for (let k = 0; k < n; k++) {
+        const s = (k + .5) * c.length / n, p = c.at(s);
+        if (p.z < HOUSE.sideZ0 + 0.8) continue;
+        const boxIdx = Math.floor(s / 2.5);
+        if (ti < 3 && p.z < HOUSE.backCz && (s % 2.5) < 0.35) continue; // box partitions on the sides
+        seats.push({ x: p.x, y: top - 1.0 + r * rise, z: p.z, fx: p.nx, fz: p.nz, tier: ti + 1, row: r, box: ti < 3 && p.z < HOUSE.backCz ? boxIdx + 1 : 0 });
+      }
+    }
+  });
+  // ── who came tonight: ~94% occupancy, fuller in the good seats
+  const people = [];
+  for (const s of seats) {
+    const good = s.tier === 0 ? 1 - s.row / 60 : 0.93 - s.tier * 0.02;
+    s.occupied = rng() < good * 0.97;
+    if (!s.occupied) continue;
+    s.person = people.length;
+    people.push(s);
+  }
+  // distance and bearing from the performer's home mark (for audio zones and sight-lines)
+  for (const p of people) {
+    const dx = p.x, dz = p.z - PERF_Z, dy = p.y + 1.1 - (STAGE_Y + EYE);
+    p.dist = Math.hypot(dx, dy, dz);
+    p.az = Math.atan2(dx, dz);
+    p.el = Math.atan2(dy, Math.hypot(dx, dz));
+  }
+  // neighbours (for contagion) and "the people in front of me" (for the standing cascade: you see the rows ahead)
+  const N = people.length, cell = 2.2, grid = new Map(), key = (i, j, k) => i + ',' + j + ',' + k;
+  people.forEach((p, i) => { const kk = key(Math.floor(p.x / cell), Math.floor(p.y / cell), Math.floor(p.z / cell)); (grid.get(kk) || grid.set(kk, []).get(kk)).push(i); });
+  for (let i = 0; i < N; i++) {
+    const p = people[i], gi = Math.floor(p.x / cell), gj = Math.floor(p.y / cell), gk = Math.floor(p.z / cell);
+    const near = [], front = [];
+    for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let c = -1; c <= 1; c++) {
+      const list = grid.get(key(gi + a, gj + b, gk + c)); if (!list) continue;
+      for (const j of list) { if (j === i) continue; const q = people[j];
+        const d = Math.hypot(q.x - p.x, (q.y - p.y) * 1.5, q.z - p.z);
+        if (d < 2.3) near.push([d, j]);
+        // in front: closer to the stage along my facing, roughly within my view cone, same level
+        const ahead = (q.x - p.x) * p.fx + (q.z - p.z) * p.fz, side = Math.abs((q.x - p.x) * p.fz - (q.z - p.z) * p.fx);
+        if (ahead > 0.3 && ahead < 3.2 && side < ahead * 1.1 + 0.6 && Math.abs(q.y - p.y) < 1.0 && q.tier === p.tier) front.push([ahead + side, j]);
+      }
+    }
+    near.sort((u, v) => u[0] - v[0]); front.sort((u, v) => u[0] - v[0]);
+    p.near = near.slice(0, 10).map(e => e[1]);
+    p.front = front.slice(0, 7).map(e => e[1]);
+  }
+  return { seats, people, N, rng };
+}
+
+// ───────── crowd.js ─────────
+// crowd.js — the audience as a physical system.
+//
+//  • Onset/offset of clapping by social contagion: you start when you're moved and hear others; you stop when
+//    they stop (Mann, Faria, Sumpter & Krause 2013, "The dynamics of audience applause").
+//  • Two clapping modes: fast, loose "mode I" (~4 Hz) and slow, even "mode II" (~2 Hz, half the dispersion). Only in
+//    mode II is the crowd able to lock phase: a Kuramoto mean field of what everyone hears. When they want to be
+//    louder they speed up again and the rhythm dissolves (Néda, Ravasz, Brechet, Vicsek & Barabási 2000).
+//  • Standing: you stand when moved enough, or when the people you can see in front of you are standing
+//    (Miller & Page 2004, "The standing ovation problem"). So it starts at the front and rolls backwards and up.
+//
+// The model runs a little ahead of the picture so audio can be scheduled sample-accurately; the picture reads
+// per-person clap times from the past.
+
+function createCrowd(house, night, t0) {
+  t0 = t0 || 0;
+  const P = house.people, N = house.N, rng = makeRng(night.seed * 7 + 1);
+  const A = n => new Float32Array(n);
+  const base = A(N), e = A(N), drift = A(N), local = A(N);
+  const clap = new Uint8Array(N), th = A(N), f1 = A(N), f2 = A(N), joins = A(N), m = A(N), force = A(N);
+  const stand = new Uint8Array(N), standH = A(N), tau = A(N), sigma = A(N), pendT = A(N), arms = A(N);
+  const lastClap = new Float64Array(N).fill(t0 - 9), prevClap = new Float64Array(N).fill(t0 - 9);
+  const whistler = new Uint8Array(N), stamper = new Uint8Array(N), leave = A(N), leaveAt = new Float32Array(N).fill(1e9);
+  const gaze = A(N), react = A(N);
+  const mode = new Uint8Array(N), rest = A(N), stamina = A(N), holdout = new Uint8Array(N), armsT = A(N), phone = A(N), phoneT = A(N), shout = A(N);
+  for (let i = 0; i < N; i++) {
+    const p = P[i];
+    // how much this person loved it: tonight's mood, plus the front rows are always a little keener
+    base[i] = clamp(night.mood + 0.16 * rng.gauss() + (p.tier === 0 ? 0.06 * (1 - p.row / 20) : 0) + (p.tier === 4 ? 0.05 : 0), 0.05, 1.2);
+    f1[i] = clamp(3.9 + 0.5 * rng.gauss(), 2.8, 5.3) * night.tempo;
+    f2[i] = clamp(1.95 + 0.09 * rng.gauss(), 1.65, 2.3) * night.tempo;
+    joins[i] = rng() < night.rhythmic ? 1 : 0.15 * rng();
+    th[i] = rng() * TAU;
+    tau[i] = clamp(0.92 + 0.14 * rng.gauss(), 0.7, 1.2);     // stand on your own above this
+    sigma[i] = clamp(0.45 + 0.2 * rng.gauss(), 0.15, 0.85);  // stand if this share of those in front are standing
+    whistler[i] = rng() < 0.05 ? 1 : 0;
+    stamper[i] = rng() < 0.45 ? 1 : 0;
+    react[i] = 0.25 + 0.9 * rng() * rng();                  // reaction delay
+    stamina[i] = 9 + 16 * rng();                            // seconds of clapping before your hands need a moment
+    phoneT[i] = rng() < 0.035 ? 0.95 + 0.2 * rng() : 9;    // the ones who film it
+    armsT[i] = rng() < 0.3 ? 0 : 0.25 + 0.4 * rng() + (p.tier === 0 ? p.row / 50 : 0.1);   // who throws their arms up
+    if (rng() < 0.018) { holdout[i] = 1; base[i] *= 0.35; } // there is always someone who didn't care for it
+  }
+  const S = {
+    t: t0, G: 0, D: 0, hush: 0, gone: 0, frac: 0, R: 0, Psi: 0, standFrac: 0, leaving: 0, lastIdx: -1, lastMode: 0,
+    events: [], clapRate: 0, meanM: 0,
+  };
+  let gazeDir = [0, 1], gazeFocus = 0;
+  const fracNear = A(N);
+
+  function setGaze(dirX, dirZ, focus) { gazeDir = [dirX, dirZ]; gazeFocus = focus; }
+
+  // A bow (or anything the performer does) lands harder on the people you're facing.
+  function stimulate(amount, spread) {
+    for (let i = 0; i < N; i++) {
+      const p = P[i]; const dx = p.x - night.perfX, dz = p.z - PERF_Z, l = Math.hypot(dx, dz) || 1;
+      const facing = (dx * gazeDir[0] + dz * gazeDir[1]) / l;
+      const w = spread + (1 - spread) * smooth(0.55, 0.97, facing);
+      local[i] = Math.min(0.6, local[i] + amount * w * (0.8 + 0.4 * rng()));
+    }
+  }
+
+  function firstClapper() {
+    // someone keen, near the front and near the middle, so you can see where it starts
+    let best = -1, bs = -1;
+    for (let i = 0; i < N; i++) { const p = P[i]; if (p.tier !== 0 || p.row > 6 || Math.abs(p.x) > 3.4) continue; const s = base[i] + rng() * 0.3; if (s > bs) { bs = s; best = i; } }
+    if (best < 0) best = 0;
+    local[best] = 0.6; base[best] = 1.2; clap[best] = 1; th[best] = TAU - 0.05; return best;
+  }
+
+  const DT = 1 / 120;
+  function step(dt) {
+    const t = S.t += dt;
+    const G = S.G;
+    // mean fields: the whole room, and the pulse of those clapping in the slow mode (the rhythm you can hear forming)
+    let nc = 0, sx = 0, sy = 0, ws = 0, ns = 0, mm = 0, n2 = 0, sx2 = 0, sy2 = 0, w2 = 0;
+    for (let i = 0; i < N; i++) if (clap[i] && leave[i] === 0) {
+      nc++; const w = force[i] || 1, c = Math.cos(th[i]), sn = Math.sin(th[i]); sx += w * c; sy += w * sn; ws += w; mm += m[i];
+      if (mode[i]) { n2++; sx2 += w * c; sy2 += w * sn; w2 += w; }
+    }
+    const present = N - S.leaving * N;
+    S.frac = nc / Math.max(1, present); S.R = ws ? Math.hypot(sx, sy) / ws : 0; S.Psi = Math.atan2(sy, sx); S.meanM = nc ? mm / nc : 0;
+    const R2 = w2 ? Math.hypot(sx2, sy2) / w2 : 0, Psi2 = Math.atan2(sy2, sx2); S.R2 = R2; S.n2 = nc ? n2 / nc : 0;
+    const R = S.R, Psi = S.Psi, frac = S.frac;
+    for (let i = 0; i < N; i++) {
+      if (leave[i] > 0) { const was = leave[i]; leave[i] += dt / 7; clap[i] = 0; standH[i] = approach(standH[i], 1, 5, dt); arms[i] = approach(arms[i], 0, 3, dt); phone[i] = 0; if (was < 1 && leave[i] >= 1) S.gone += 1 / N; continue; }
+      if (t > leaveAt[i]) { leave[i] = 1e-4; stand[i] = 1; clap[i] = 0; S.events.push({ t, type: 'thunk', i, g: 0.7 }); S.leaving += 1 / N; continue; }
+      const p = P[i];
+      // excitement: tonight's love × the room's energy, plus what you did to me, plus my own wandering attention
+      drift[i] += (-drift[i] * 0.4 + 0.18 * rng.gauss()) * dt;
+      local[i] *= Math.exp(-dt / 6);
+      const ei = e[i] = Math.max(0, base[i] * G + local[i] + drift[i] * 0.25 * G);
+      // how much applause I can hear around me
+      let nn = 0; const ne = p.near; for (let k = 0; k < ne.length; k++) nn += clap[ne[k]]; fracNear[i] = ne.length ? nn / ne.length : frac;
+      const heard = 0.55 * fracNear[i] + 0.45 * frac;
+      if (i === S.lastIdx && S.lastMode) {
+        // the last one: slow, deliberate, alone
+        clap[i] = S.lastMode === 1 ? 1 : 0; m[i] = 1; force[i] = 1.5;
+        arms[i] = approach(arms[i], S.lastMode === 3 ? 1 : 0, 2.5, dt);   // you bowed to them: both arms up
+        const prev = th[i]; th[i] += TAU * 0.95 * dt;
+        if (clap[i] && Math.floor(th[i] / TAU) !== Math.floor(prev / TAU)) emitClap(i, t - (th[i] % TAU) / (TAU * 0.95));
+        standH[i] = approach(standH[i], 1, 3, dt); continue;
+      }
+      if (rest[i] > 0) { rest[i] -= dt; if (rest[i] <= 0 && ei > 0.3) { clap[i] = 1; th[i] = (mode[i] ? Psi2 : Psi) + (rng() - .5) * 2; } }
+      else if (!clap[i]) {
+        const rOn = Math.max(0, ei - 0.12) * (0.2 + 9 * heard) * (1 - S.hush) * (holdout[i] ? 0.15 : 1);
+        if (rng() < rOn * dt) { clap[i] = 1; th[i] = (mode[i] ? Psi2 : Psi) + (rng() - .5) * 5.5; stamina[i] = 9 + 16 * rng(); }
+      } else {
+        const rOff = Math.max(0, 0.22 - ei) * 7 + (1 - heard) * 0.35 * (ei < 0.45 ? 1 : 0) + S.hush * 5 + (ei < 0.05 ? 2 : 0);
+        if (rng() < rOff * dt) clap[i] = 0;
+        // hands sting: a short pause, then back in
+        stamina[i] -= dt * (1 + 0.5 * (1 - mode[i]));
+        if (stamina[i] < 0 && S.lastMode === 0) { clap[i] = 0; rest[i] = 0.8 + 2.2 * rng(); stamina[i] = 9 + 16 * rng(); }
+      }
+      // standing: my own feeling, or what I see in front of me
+      let fs = 0; const fr = p.front; for (let k = 0; k < fr.length; k++) fs += stand[fr[k]]; const seen = fr.length ? fs / fr.length : 0;
+      const wantUp = (ei > tau[i] || (seen > sigma[i] && ei > 0.42)) && S.hush < 0.3;
+      const wantDown = (ei < tau[i] - 0.4 && seen < 0.35) || S.hush > 0.5 || ei < 0.15;
+      if (!stand[i] && wantUp) { pendT[i] += dt; if (pendT[i] > react[i]) { stand[i] = 1; pendT[i] = 0; S.events.push({ t: t + 0.12, type: 'thunk', i, g: 1 }); } }
+      else if (stand[i] && wantDown) { pendT[i] += dt; if (pendT[i] > react[i] * 1.6) { stand[i] = 0; pendT[i] = 0; } }
+      else pendT[i] = Math.max(0, pendT[i] - dt);
+      standH[i] = approach(standH[i], stand[i], 5, dt);
+      if (stand[i]) ns++;
+      phone[i] = approach(phone[i], stand[i] && ei > phoneT[i] && S.lastMode === 0 ? 1 : 0, 1.5, dt);
+      arms[i] = approach(arms[i], stand[i] && ei > 1.05 + armsT[i] ? 1 : 0, 2, dt);
+      // clapping mode (Néda et al.): each person is either clapping fast and loose, or has dropped to the slow, even
+      // mode at half the rate. You drop into it when the room wants rhythm and you can hear the pulse; you leave it
+      // the moment the room wants to be louder.
+      if (!mode[i]) { if (rng() < S.D * joins[i] * (0.25 + 2.2 * R2 * S.n2) * dt) { mode[i] = 1; th[i] = n2 > 3 ? Psi2 + (rng() - .5) * 1.2 : th[i]; } }
+      else if (rng() < ((1 - S.D) * 1.6 + (joins[i] < 0.5 ? 0.5 : 0)) * dt) mode[i] = 0;
+      m[i] = approach(m[i], mode[i], 5, dt);
+      if (!clap[i]) continue;
+      force[i] = (0.55 + 0.55 * Math.min(1.3, ei)) * (1 + 0.35 * m[i]) * (1 + 0.1 * stand[i]);
+      const f = f1[i] * (0.9 + 0.15 * Math.min(1, ei)) * (1 - m[i]) + f2[i] * m[i];
+      const K = 5.6 * m[i] * m[i];
+      const prev = th[i];
+      th[i] += (TAU * f + K * R2 * Math.sin(Psi2 - th[i])) * dt + 0.85 * Math.sqrt(dt) * rng.gauss();
+      if (Math.floor(th[i] / TAU) !== Math.floor(prev / TAU)) {
+        const tc = t - (((th[i] % TAU) + TAU) % TAU) / (TAU * f);
+        emitClap(i, tc);
+        if (m[i] > 0.8 && stamper[i] && S.D > 0.7 && R2 > 0.5 && (Math.floor(th[i] / TAU) & 1)) S.events.push({ t: tc + 0.01, type: 'stamp', i, g: 0.5 + 0.5 * m[i] });
+      }
+      if (whistler[i] && ei > 0.8 && rng() < (ei - 0.8) * 0.25 * dt) S.events.push({ t, type: 'whistle', i, g: 0.6 + 0.4 * rng() });
+    }
+    S.standFrac = ns / Math.max(1, present);
+  }
+  function emitClap(i, tc) {
+    prevClap[i] = lastClap[i]; lastClap[i] = tc;
+    S.events.push({ t: tc, type: 'clap', i, g: force[i] });
+    S.clapRate += 1;
+  }
+
+  // everyone leaves, in a plausible order: aisle seats and the back first; one person stays
+  // where someone is on their way out: along the row to the aisle, then up it; from the boxes, back through the door
+  const walkOut = [0, 0];
+  function walkOffset(i) {
+    const lv = leave[i], p = P[i];
+    if (lv <= 0) { walkOut[0] = 0; walkOut[1] = 0; return walkOut; }
+    if (p.tier === 0) { const ax = Math.sign(p.x || 1) * 4.0, u = smooth(0, 0.35, lv), w = Math.max(0, lv - 0.35) / 0.65; walkOut[0] = (ax - p.x) * u; walkOut[1] = w * (24 - p.z); }
+    else { const u = Math.min(1, lv * 1.6); walkOut[0] = -p.fx * 2.4 * u; walkOut[1] = -p.fz * 2.4 * u; }
+    return walkOut;
+  }
+  // milk it, and a few people quietly reach for their coats while the rest are still clapping
+  function earlyLeavers(frac, t0) {
+    for (let i = 0; i < N; i++) { const p = P[i]; if (leaveAt[i] < 1e8 || i === S.lastIdx) continue;
+      const aisle = p.tier === 0 ? Math.abs(Math.abs(p.x) - 4.0) < 1.2 : rng() < 0.5;
+      if (aisle && rng() < frac) leaveAt[i] = t0 + rng() * 6; }
+  }
+  function beginLeaving(t0, nobody) {
+    let last = -1, bs = -1;
+    for (let i = 0; i < N && !nobody; i++) { const p = P[i]; if (p.tier === 0 && p.row >= 3 && p.row <= 5 && Math.abs(p.x) > 0.8 && Math.abs(p.x) < 2.6) { const s = base[i] + rng() * 0.2; if (s > bs) { bs = s; last = i; } } }
+    S.lastIdx = last;
+    for (let i = 0; i < N; i++) {
+      if (i === last) continue;
+      const p = P[i], aisle = p.tier === 0 ? Math.min(Math.abs(Math.abs(p.x) - 4.0), 3) / 3 : rng();
+      leaveAt[i] = t0 + 1.0 + 16 * Math.pow(rng(), 0.8) * (0.5 + 0.5 * aisle) + (p.tier === 0 ? 0 : 2 * rng());
+    }
+  }
+
+  return { S, N, P, e, clap, mode, rest, holdout, th, f1, f2, m, stand, standH, arms, leave, lastClap, prevClap, base, local, force, DT, step, stimulate, setGaze, firstClapper, beginLeaving, earlyLeavers, phone, walkOffset, shout };
+}
+
+// ───────── director.js ─────────
+// director.js — the shape of one night. Nothing here is scripted beat-for-beat: it sets the room's energy (G), its wish
+// for rhythm (D) and the lights, and the crowd model does the rest. The performer (you) is state here too.
+
+function newNight(seed) {
+  const r = makeRng(seed * 13 + 5);
+  // every night is a different house: warmer or cooler, more or less inclined to fall into rhythm
+  const mood = clamp(0.86 + 0.11 * r.gauss(), 0.64, 1.04);
+  return { seed, mood, tempo: clamp(1 + 0.05 * r.gauss(), 0.9, 1.1), rhythmic: clamp(0.72 + 0.16 * r.gauss(), 0.35, 0.95), perfX: 0 };
+}
+
+function createDirector(night, crowd) {
+  const S = crowd.S;
+  const D = {
+    phase: 'preshow', t: 0, phaseT: 0, audioOn: false,
+    // lights
+    spot: 0, spotX: 0, stage: 0, house: 0, chand: 0.08, fade: 1, title: 1,
+    // performer
+    x: 0, tx: 0, vx: 0, bow: 0, bowing: false, bowHeld: 0, bowPeak: 0, bowFired: false, lookYaw: 0, lookPitch: 0, walkYaw: 0, stepPhase: 0,
+    offstage: false, offT: 0, returns: 0,
+    // the room's economy of love
+    fresh: 1, budget: 1, lastStim: -99, quietT: 0, lastPhaseWave: 0,
+    flowers: [], cues: [], lastBowAt: -99, lastTapT: -99, cheer: 0, applauseT: 0, roses: 0, torch: 0, torchT: 0, everOff: false,
+    conductor: { clap: 0, arms: 0 },
+    endText: 0,
+  };
+  const cue = (type, extra) => D.cues.push(Object.assign({ type, t: D.t }, extra || {}));
+  const setPhase = p => { D.phase = p; D.phaseT = 0; };
+
+  function start(withAudio) {
+    if (D.phase !== 'preshow') return;
+    D.audioOn = withAudio; setPhase('lights');
+  }
+
+  // ── input ───────────────────────────────────────────────
+  function press() {
+    D.lastTapT = D.t; D.touched = true;
+    if (D.phase === 'preshow') { start(true); return; }
+    if (D.phase === 'lights') return;
+    if (D.phase === 'end') return;
+    if (D.offstage || Math.abs(D.tx) > WING_X) { D.tx = 0; return; }   // in the wings a tap means: go back on
+    D.bowing = true; D.bowHeld = 0; D.bowFired = false; D.pressT = D.t; D.releaseAsked = false;
+  }
+  // a tap still makes a whole bow: you go down, you stay a beat, you come up
+  function release() { D.releaseAsked = true; }
+  function walkBy(dxMetres) { D.tx = clamp(D.tx + dxMetres, -9.4, 9.4); noteExit(); }
+  function walkTo(x) { D.tx = clamp(x, -9.4, 9.4); noteExit(); }
+  // the moment you head for the wings is the moment the house judges your exit
+  function noteExit() { if (Math.abs(D.tx) > WING_X && !D.exitJudged && D.phase === 'ovation') { D.exitJudged = true; D.goodExit = S.G > 0.42 && D.phaseT > 4 && D.returns < 4 && D.budget > 0.12; D.callLen = 8 + 7 * D.budget; D.exitAt = D.t; } if (Math.abs(D.tx) <= WING_X) D.exitJudged = false; }
+  function look(nx, ny) { D.lookYaw = nx * 0.2; D.lookPitch = -ny * 0.09; }
+
+  // ── the bow lands ──────────────────────────────────────
+  function bowLands(depth) {
+    const deep = smooth(0.4, 1, depth);
+    if (D.phase === 'ovation' || D.phase === 'breath') {
+      if (D.phase === 'breath') { setPhase('ovation'); D.first = crowd.firstClapper(); S.G = 0.2; D.lastStim = D.t; D.bows = 0; return; }   // your bow breaks the silence
+      // a bow is worth most when the room is starting to let go, least when it's already on its feet; the first one
+      // is the one they've been waiting for; every one draws on a finite reserve of love
+      const timing = clamp(1.3 - 0.55 * S.G, 0.55, 1.2), first = D.bows ? 1 : 1.3;
+      const gain = (0.2 + 0.26 * deep) * D.fresh * timing * first * Math.pow(D.budget, 0.7);
+      S.G = Math.min(1.32, S.G + gain);
+      D.cheer = Math.min(1, D.cheer + 0.25 + 0.6 * gain); S.surge = Math.min(1, (S.surge || 0) + gain * 2.2);
+      crowd.stimulate(0.55 * gain, 0.35);            // those you face feel it most, but it comes from the same reserve
+      S.D = Math.max(0, S.D - 0.55);                 // wanting more breaks the rhythm
+      const greedy = D.budget < 0.3 && D.fresh < 0.55;
+      D.budget = Math.max(0, D.budget - 0.055 * (1 + 1.5 * (1 - D.fresh))); D.fresh *= 0.72; D.lastStim = D.t;
+      D.bows = (D.bows || 0) + 1;
+      if (greedy) { if (!D.booed) { D.booed = true; cue('boo'); } if (S.leaving < 0.2) crowd.earlyLeavers(0.05 + 0.1 * (0.3 - D.budget), crowd.S.t + 1); }
+      // bow on and on after there's nothing left to give, and the house manager brings the lights up on you mid-bow
+      if (D.budget <= 0) { D.spent = (D.spent || 0) + 1; if (D.spent >= 3) { D.spoiled = true; setPhase('leaving'); crowd.beginLeaving(crowd.S.t + 0.5, true); S.G = Math.min(S.G, 0.3); cue('houselights'); } }
+      if (S.G > 0.8 && S.standFrac > 0.35 && Math.random() < 0.6) throwFlowers(2 + (Math.random() * 3 | 0));
+    } else if (D.phase === 'leaving') {
+      // a few people on their way out turn and clap again, briefly; the ones nearest the stage most
+      S.G = Math.min(0.3, S.G + 0.16 * D.fresh); crowd.stimulate(0.22 * D.fresh, 0.08); D.fresh *= 0.6; D.cheer = Math.max(D.cheer, 0.15 * D.fresh);
+    } else if (D.phase === 'last' && !D.lastBowed) {
+      D.lastBowed = true; if (S.lastMode === 1) { S.lastMode = 3; D.lastStep = 2; D.lastStopAt = D.t; cue('cheerOne'); }
+    }
+  }
+
+  function throwFlowers(n) {
+    const P = crowd.P;
+    for (let k = 0; k < n; k++) {
+      let i = -1; for (let tries = 0; tries < 400; tries++) { const j = (Math.random() * crowd.N) | 0; if ((P[j].tier === 0 && P[j].row < 5) || (P[j].tier === 1 && P[j].row === 0 && Math.random() < 0.3)) { i = j; break; } }
+      if (i >= 0) crowd.stand[i] = 1;   // you stand up to throw
+      if (i < 0) continue;
+      const aim = Math.abs(D.tx) < WING_X ? D.tx : D.x, p = P[i], tx = clamp(aim + (Math.random() - .5) * 2.6, -6.5, 6.5), tz = PERF_Z + 0.5 + Math.random() * 2.4;
+      D.flowers.push({ x0: p.x, y0: p.y + 1.7, z0: p.z, x1: tx, z1: tz, t0: D.t + k * 0.35 + Math.random() * 0.3, dur: 1.0 + Math.random() * 0.35, spin: (Math.random() - .5) * 14, rot0: Math.random() * TAU, landed: false, hue: Math.random() });
+    }
+  }
+
+  // ── per-frame ──────────────────────────────────────────
+  function update(dt) {
+    D.t += dt; D.phaseT += dt;
+    // performer body
+    const dx = D.tx - D.x; const want = clamp(dx * 2.2, -1.7, 1.7);
+    D.vx = approach(D.vx, want, 6, dt); D.x += D.vx * dt; night.perfX = D.x;
+    const moving = Math.abs(D.vx) > 0.15;
+    if (moving) { const prev = D.stepPhase; D.stepPhase += Math.abs(D.vx) * dt / 0.7; if (Math.floor(prev) !== Math.floor(D.stepPhase)) cue('step', { x: D.x }); }
+    D.walkYaw = approach(D.walkYaw, moving ? clamp(D.vx * 0.1, -0.15, 0.15) : 0, 3, dt);
+    if (D.bowing) { D.bowHeld += dt; if (D.releaseAsked && D.t - D.pressT > 0.5) D.bowing = false; }
+    const bowTarget = D.bowing ? clamp(0.45 + D.bowHeld * 0.5, 0, 1) : 0;
+    D.bow = approach(D.bow, bowTarget, D.bowing ? 3.6 : 3.2, dt);
+    if (D.bowing && !D.bowFired && D.bow > 0.34) { D.bowFired = true; D.bowPeak = 0; D.lastBowAt = D.t; }
+    if (D.bowFired && D.bowing) D.bowPeak = Math.max(D.bowPeak, D.bow);
+    if (D.bowFired && (!D.bowing || D.bowHeld > 1.6) && !D.bowLanded) { D.bowLanded = true; bowLands(Math.max(D.bowPeak, D.bow)); }
+    if (!D.bowing) { D.bowFired = false; D.bowLanded = false; }
+    // where you face decides who feels it most
+    const yaw = D.lookYaw + D.walkYaw;
+    crowd.setGaze(Math.sin(yaw), Math.cos(yaw), 1);
+    // the follow-spot operator keeps up, a little late
+    // …and when you leave, it goes back to where you stood and waits for you
+    D.spotX = approach(D.spotX, D.offT > 1.0 ? 0 : clamp(D.x, -WING_X + 0.4, WING_X - 0.4), D.offT > 1.0 ? 1.6 : 2.2, dt);
+    const wasOff = D.offstage; D.offstage = Math.abs(D.x) > WING_X; if (D.offstage) D.everOff = true;
+    // the stage manager, once, when the first wave has peaked and you haven't thought of leaving: a torch waves from the wing
+    if (D.phase === 'ovation' && !D.offstage && Math.abs(D.tx) < WING_X && D.returns < 3 && D.phaseT > 9 && S.G > 0.5 && D.t - (D.lastTorch || -99) > 16 && D.t - (D.lastReturnT || -99) > 7) { D.lastTorch = D.t; D.torchT = 6; if (!D.glanced) { D.glanced = true; D.glanceT = 1.4; } }
+    D.glanceT = Math.max(0, (D.glanceT || 0) - dt);
+    D.torchT = Math.max(0, D.torchT - dt); D.torch = approach(D.torch, D.torchT > 0 && !D.offstage ? 1 : 0, 4, dt);
+    // the conductor claps along with the house, and cheers you back on
+    const cond = D.conductor; cond.clap = (D.phase === 'ovation' && S.G > 0.3) || (D.phase === 'leaving' && D.phaseT < 3) ? 1 : 0;
+    cond.arms = approach(cond.arms, D.condCheer > D.t ? 1 : 0, 3, dt);
+    if (D.phase === 'leaving' && D.phaseT > 4 || D.phase === 'last' || D.phase === 'closing' || D.phase === 'end') cond.gone = Math.min(1, (cond.gone || 0) + dt / 6);
+    D.fresh += (1 - D.fresh) * 0.045 * dt;
+    D.cheer = Math.max(0, D.cheer - dt * 0.28); S.surge = Math.max(0, (S.surge || 0) - dt * 0.45);
+    if (D.phase === 'ovation' && D.phaseT > 1.5 && D.phaseT < 3.5) D.cheer = Math.max(D.cheer, 0.55 * night.mood);
+
+    const P = D.phase;
+    if (P === 'preshow') {
+      D.title = 1; if (D.phaseT > 3.8) start(false);
+    } else if (P === 'lights') {
+      D.title = approach(D.title, 0, 7, dt); if (D.title < 0.25) D.fade = approach(D.fade, 0, 2.5, dt);
+      if (D.phaseT > 0.35 && !D.clunked) { D.clunked = true; cue('clunk'); }
+      if (D.clunked) { D.spot = approach(D.spot, 1, 14, dt); D.stage = approach(D.stage, 1, 2, dt); }
+      if (D.phaseT > 1.2) { setPhase('breath'); cue('cough'); }
+    } else if (P === 'breath') {
+      D.title = approach(D.title, 0, 7, dt); D.fade = approach(D.fade, 0, 2.5, dt);
+      D.spot = approach(D.spot, 1, 8, dt); D.stage = approach(D.stage, 1, 2, dt);
+      if (D.t - (D.lastBeat || -9) > 0.62) { D.lastBeat = D.t; cue('heart'); }
+      // they wait for you to bow. If you never do, someone can't hold it in any longer.
+      if (D.phaseT > 9) { setPhase('ovation'); D.first = crowd.firstClapper(); S.G = 0.2; D.lastStim = D.t; }
+    } else if (P === 'ovation') {
+      D.fade = approach(D.fade, 0, 2, dt);
+      // the first wave: it builds by itself for a few seconds after that first clap
+      const opening = D.phaseT < 4.5;
+      if (opening) S.G = Math.min(0.76 * night.mood + 0.04, S.G + dt * 0.3);
+      else if (!D.offstage) {
+        const tau = 14 * (1 + 1.0 * smooth(0.15, 0.5, S.n2 || 0));   // a rhythmic house is a patient house
+        S.G -= S.G / tau * dt;
+      }
+      // Néda's cycle: a house that has held its rhythm for a while wants to be louder, speeds up, and loses it
+      if ((S.n2 || 0) > 0.55 && !D.offstage) { D.syncT = (D.syncT || 0) + dt; if (D.syncT > (D.syncLen || (D.syncLen = 7 + 6 * Math.random()))) { D.surgeT = 3.2; D.syncT = 0; D.syncLen = 7 + 6 * Math.random(); S.G = Math.min(1.1, S.G + 0.07); D.cheer = Math.max(D.cheer, 0.35); } }
+      else D.syncT = Math.max(0, (D.syncT || 0) - dt * 2);
+      if (D.surgeT > 0) { D.surgeT -= dt; S.D = approach(S.D, 0.02, 3, dt); }
+      // walking off: a good exit makes them call you back, in rhythm; a hasty one just lets the applause go
+      if (D.offstage) {
+        if (D.offT === 0 && !D.exitJudged) { D.goodExit = S.G > 0.42 && D.returns < 4 && D.budget > 0.12; D.callLen = 8 + 7 * D.budget; }
+        D.offT += dt;
+        if (D.goodExit && D.offT < D.callLen) { S.G = Math.min(1.0, S.G + 0.01 * dt); S.D = approach(S.D, 1, 0.35, dt); }
+        else { S.G -= S.G / (D.goodExit ? 5 : D.offT < 6 ? 9 : 3.5) * dt; S.D = approach(S.D, 0, 0.3, dt); }
+      } else {
+        if (wasOff) { // you came back
+          const calling = D.goodExit && D.offT < D.callLen + 1; D.exitJudged = false;
+          const g = calling ? 0.5 * Math.pow(0.72, D.returns) * (0.3 + 0.7 * D.budget) : 0.12;
+          if (S.G > 0.05 || !calling) {
+            S.G = Math.min(1.32, S.G + g); D.cheer = calling ? 1 : 0.2; crowd.stimulate(calling ? 0.25 * Math.pow(0.7, D.returns) * (0.3 + 0.7 * D.budget) : 0.04, 0.6); S.D = Math.max(0, S.D - 0.7);
+            if (calling) { throwFlowers(3 + (Math.random() * 4 | 0)); D.condCheer = D.t + 2.5; }
+          }
+          if (calling) { D.returns++; D.budget = Math.max(0, D.budget - 0.14); } D.lastReturnT = D.t;
+          D.lastStim = D.t;
+        }
+        D.offT = 0;
+        // left alone at a good level, the house finds its rhythm (on some nights more than others)
+        const settled = D.t - D.lastStim > 3 && S.G > 0.38 && S.frac > 0.45 && !(D.surgeT > 0);
+        S.D = approach(S.D, settled ? night.rhythmic : 0, settled ? 0.24 : 0.5, dt);
+      }
+      S.D = clamp(S.D, 0, 1);
+      // when it has died away, the house lights come up
+      if (S.frac < 0.035 && S.G < 0.14 && D.phaseT > 14 && (!D.offstage || D.offT > 12)) D.quietT += dt; else D.quietT = 0;
+      if (D.quietT > 2.6) { setPhase('leaving'); crowd.beginLeaving(crowd.S.t + 0.5); S.G = 0; cue('houselights'); }
+    } else if (P === 'leaving') {
+      D.house = approach(D.house, 0.62, 0.5, dt); D.chand = approach(D.chand, 0.8, 0.4, dt);
+      S.G -= S.G / (D.t - D.lastBowAt < 3 ? 6 : 3) * dt; S.D = approach(S.D, 0, 1, dt);
+      if (Math.random() < 0.8 * dt * (1 - S.leaving)) cue('rustle');
+      if (S.gone > 0.97 && D.phaseT > 9) { if (S.lastIdx >= 0) { setPhase('last'); D.lastStep = 0; } else setPhase('closing'); }
+    } else if (P === 'last') {
+      D.house = approach(D.house, 0.5, 0.35, dt); D.chand = approach(D.chand, 0.45, 0.35, dt);
+      // the one who stayed
+      if (D.lastStep === 0 && D.phaseT > 1.4) { D.lastStep = 1; S.lastMode = 1; D.lastClapStart = D.t; }
+      if (D.lastStep === 1 && (D.lastBowed || D.t - D.lastClapStart > 8.5)) { D.lastStep = 2; S.lastMode = 2; D.lastStopAt = D.t; }
+      if (D.lastStep === 2 && D.t - D.lastStopAt > (D.lastBowed ? 3.2 : 1.4)) { D.lastStep = 3; crowd.leave[S.lastIdx] = 1e-4; }
+      if (D.lastStep === 3 && D.t - D.lastStopAt > 6.5) setPhase('closing');
+    } else if (P === 'closing') {
+      D.house = approach(D.house, 0, 0.5, dt); D.chand = approach(D.chand, 0, 0.5, dt);
+      if (D.phaseT > 3.5 && !D.offClunk) { D.offClunk = true; cue('clunk'); }
+      if (D.offClunk) { D.spot = approach(D.spot, 0, 12, dt); D.stage = approach(D.stage, 0, 1.2, dt); D.fade = approach(D.fade, 1, 0.5, dt); }
+      if (D.phaseT > 7) setPhase('end');
+    } else if (P === 'end') {
+      D.fade = approach(D.fade, 1, 1, dt); D.endText = approach(D.endText, 1, 1.2, dt);
+    }
+    // flowers in flight
+    for (const f of D.flowers) if (!f.landed && D.t > f.t0 + f.dur) { f.landed = true; D.roses++; cue('flower', { x: f.x1, z: f.z1 }); }
+    if (S.frac > 0.2 && D.phase === 'ovation') D.applauseT += dt;
+    D.maxStand = Math.max(D.maxStand || 0, S.standFrac || 0);
+  }
+
+  return Object.assign(D, { start, press, release, walkBy, walkTo, look, update, throwFlowers });
+}
+
+// ───────── audio.js ─────────
+// audio.js — synthesises every sound the house makes (no samples), builds the hall's reverb, and schedules the
+// crowd's events onto the audio thread with the physical delay of sound travelling from each seat to the stage.
+
+function createAudio(house) {
+  const A = { ctx: null, node: null, ready: false, sr: 48000, offset: null, muffle: 0, empty: 0, level: 0.5 };
+  const NAMES = ['clap', 'stamp', 'thunk', 'whistle', 'cough', 'rustle', 'step', 'flower', 'clunk', 'creak', 'heart', 'bowtap', 'shout', 'boo'];
+  const ID = Object.fromEntries(NAMES.map((n, i) => [n, i]));
+  const P = house.people, N = house.N;
+
+  // ── zones of the house: bearing × distance from the performer's mark ─────────────
+  const AZB = 6, DB = [11, 19];
+  const zoneOf = new Int16Array(N), zones = [];
+  for (let k = 0; k < AZB * (DB.length + 1); k++) zones.push({ x: 0, y: 0, z: 0, n: 0, d: 0 });
+  for (let i = 0; i < N; i++) {
+    const p = P[i], ab = clamp(Math.floor((p.az + 1.25) / 2.5 * AZB), 0, AZB - 1), db = p.dist < DB[0] ? 0 : p.dist < DB[1] ? 1 : 2;
+    const k = db * AZB + ab; zoneOf[i] = k; const z = zones[k]; z.x += p.x; z.y += p.y + 1.2; z.z += p.z; z.n++;
+  }
+  zones.forEach(z => { if (z.n) { z.x /= z.n; z.y /= z.n; z.z /= z.n; } });
+  const NZ = zones.length;
+
+  // ── synthesis helpers ─────────────────────────────────
+  let seed = 99; const rnd = () => { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; };
+  const gauss = () => { let u = 0; while (!u) u = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * rnd()); };
+  function biquad(sr, type, fc, Q, gainDb = 0) {
+    const w = TAU * Math.min(fc, sr * 0.45) / sr, cw = Math.cos(w), sw = Math.sin(w), al = sw / (2 * Q), Ag = Math.pow(10, gainDb / 40);
+    let b0, b1, b2, a0, a1, a2;
+    if (type === 'bp') { b0 = al; b1 = 0; b2 = -al; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; }
+    else if (type === 'lp') { b0 = (1 - cw) / 2; b1 = 1 - cw; b2 = b0; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; }
+    else if (type === 'hp') { b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = b0; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; }
+    else { b0 = 1 + al * Ag; b1 = -2 * cw; b2 = 1 - al * Ag; a0 = 1 + al / Ag; a1 = -2 * cw; a2 = 1 - al / Ag; }
+    const c0 = b0 / a0, c1 = b1 / a0, c2 = b2 / a0, d1 = a1 / a0, d2 = a2 / a0; let x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    return v => { const y = c0 * v + c1 * x1 + c2 * x2 - d1 * y1 - d2 * y2; x2 = x1; x1 = v; y2 = y1; y1 = y; return y; };
+  }
+  // A small parallel-formant voice: a glottal pulse train at a gliding pitch, plus breath, through three vowel formants
+  // that can glide from one vowel to another. Used only for wordless shouts and a boo, heard far away in a big room.
+  const VOWELS = { a: [730, 1090, 2440], o: [570, 840, 2410], u: [320, 870, 2240], e: [530, 1840, 2480], ae: [660, 1720, 2410] };
+  function voice(sr, dur, f0fn, v0, v1, female, breath) {
+    const L = Math.floor(dur * sr), y = new Float32Array(L), k = female ? 1.17 : 1;
+    const A = VOWELS[v0].map(f => f * k), B = VOWELS[v1].map(f => f * k), bws = [80, 110, 160];
+    const st = [[0, 0], [0, 0], [0, 0]]; let ph = 0, prev = 0;
+    for (let i = 0; i < L; i++) {
+      const u = i / L, t = i / sr;
+      const f0 = f0fn(u) * (1 + 0.012 * Math.sin(t * 2 * Math.PI * 5.5));
+      ph += f0 / sr; if (ph >= 1) ph -= 1;
+      const pulse = ph < 0.42 ? 0.5 - 0.5 * Math.cos(2 * Math.PI * ph / 0.42) : 0, src = (pulse - prev) * 6; prev = pulse;
+      const env = smooth(0, 0.07, u) * (1 - smooth(0.72, 1, u)), x = (src + gauss() * breath) * env;
+      let out = 0;
+      for (let f = 0; f < 3; f++) {   // two-pole resonators, parallel
+        const F = lerp(A[f], B[f], smooth(0.2, 0.8, u)), r = Math.exp(-Math.PI * bws[f] / sr), c = 2 * r * Math.cos(2 * Math.PI * F / sr);
+        const yv = (1 - r) * x + c * st[f][0] - r * r * st[f][1]; st[f][1] = st[f][0]; st[f][0] = yv; out += yv * [1, 0.7, 0.35][f];
+      }
+      y[i] = out;
+    }
+    return y;
+  }
+  const norm = (y, peak = 1) => { let m = 0; for (const v of y) m = Math.max(m, Math.abs(v)); if (m) for (let i = 0; i < y.length; i++) y[i] *= peak / m; return y; };
+
+  function* makeBanks(sr, B) {
+    // Hand claps. Each "hand configuration" (Repp 1987; Peltola et al. 2007) is a noise burst through the resonance of the
+    // air pocket between the palms: flat palms ring high and short, cupped palms low and longer.
+    B.clap = [];
+    for (let b = 0; b < 128; b++) {
+      const cup = rnd(), fc = 2500 * Math.pow(0.3, cup) * (0.85 + 0.3 * rnd()), Q = 1.3 + 4.5 * cup + rnd();
+      const tau = (0.0028 + 0.0075 * cup + 0.003 * rnd()) * sr, L = Math.floor(0.032 * sr), y = new Float32Array(L);
+      const f = biquad(sr, 'bp', fc, Q), f2 = biquad(sr, 'bp', fc * (1.9 + 0.4 * rnd()), 3), h = biquad(sr, 'hp', 2800, 0.7);
+      for (let i = 0; i < L; i++) { const n = gauss() * Math.min(1, i / (0.00025 * sr)) * Math.exp(-i / tau); y[i] = f(n) + 0.25 * f2(n) + h(n) * 0.32 * Math.exp(-i / (0.0009 * sr)); }
+      B.clap.push(norm(y));
+      if ((b & 15) === 15) yield;
+    }
+    yield;
+    // Feet stamping on a raked wooden floor (in the rhythmic encore call).
+    B.stamp = [];
+    for (let b = 0; b < 16; b++) {
+      const L = Math.floor(0.14 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 65 + 45 * rnd(), 2.5), f2 = biquad(sr, 'bp', 170 + 120 * rnd(), 3.5), f3 = biquad(sr, 'bp', 800 + 700 * rnd(), 1.5);
+      for (let i = 0; i < L; i++) { const n = gauss(); y[i] = (f1(n) * 3 + f2(n) * 1.4) * Math.exp(-i / (0.03 * sr)) + f3(n) * 0.35 * Math.exp(-i / (0.005 * sr)); }
+      B.stamp.push(norm(y));
+    }
+    yield;
+    // Tip-up seats springing back as people stand: a wooden knock with a little spring.
+    B.thunk = [];
+    for (let b = 0; b < 20; b++) {
+      const L = Math.floor(0.2 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 150 + 130 * rnd(), 9), f2 = biquad(sr, 'bp', 520 + 480 * rnd(), 7), f3 = biquad(sr, 'hp', 2500, 0.7), sp = 1800 + 1500 * rnd();
+      for (let i = 0; i < L; i++) { const n = gauss() * (i < 0.0015 * sr ? 1 : 0.08); const t = i / sr;
+        y[i] = f1(n) * 2.2 * Math.exp(-t / 0.035) + f2(n) * Math.exp(-t / 0.014) + f3(n) * 0.3 * Math.exp(-t / 0.002) + 0.02 * Math.sin(TAU * sp * t) * Math.exp(-t / 0.05); }
+      B.thunk.push(norm(y));
+    }
+    yield;
+    // Two-finger whistles: a nearly pure tone that swoops, with breath.
+    B.whistle = [];
+    for (let b = 0; b < 14; b++) {
+      const dur = 0.45 + 0.6 * rnd(), L = Math.floor(dur * sr), y = new Float32Array(L), f0 = 2100 + 1300 * rnd(), kind = rnd(), br = biquad(sr, 'bp', f0, 6); let ph = 0;
+      for (let i = 0; i < L; i++) {
+        const t = i / L; let f;
+        if (kind < 0.45) f = f0 * (1 + 0.28 * Math.sin(Math.PI * Math.min(1, t * 1.5)) - 0.4 * Math.max(0, t - 0.65));
+        else if (kind < 0.8) f = f0 * (t < 0.42 ? 1 + 0.35 * t : 1.15 - 0.55 * (t - 0.42));
+        else f = f0 * (1.2 - 0.25 * t) * (1 + 0.03 * Math.sin(t * 40));
+        f *= 1 + 0.005 * Math.sin(i / sr * TAU * 6.5); ph += TAU * f / sr;
+        const env = Math.min(1, t * 30) * Math.min(1, (1 - t) * 7);
+        y[i] = (Math.sin(ph) + 0.08 * Math.sin(2 * ph) + br(gauss()) * 0.5) * env;
+      }
+      B.whistle.push(norm(y));
+    }
+    yield;
+    // Coughs: two turbulent bursts shaped by a throat.
+    B.cough = [];
+    for (let b = 0; b < 12; b++) {
+      const L = Math.floor(0.5 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 380 + 250 * rnd(), 3), f2 = biquad(sr, 'bp', 1300 + 600 * rnd(), 4), f3 = biquad(sr, 'bp', 2700 + 500 * rnd(), 4);
+      const parts = rnd() < 0.6 ? [[0, 0.075], [0.14 + 0.05 * rnd(), 0.06]] : [[0, 0.09]];
+      for (let i = 0; i < L; i++) { const t = i / sr; let env = 0; for (const [s, d] of parts) if (t >= s) env += Math.exp(-(t - s) / d) * Math.min(1, (t - s) * 500); const n = gauss() * env; y[i] = f1(n) * 2 + f2(n) + f3(n) * 0.6; }
+      B.cough.push(norm(y));
+    }
+    yield;
+    // Programmes, coats, handbags: sparse crackle through paper-ish resonances.
+    B.rustle = [];
+    for (let b = 0; b < 10; b++) {
+      const L = Math.floor((0.4 + 0.5 * rnd()) * sr), y = new Float32Array(L), f = biquad(sr, 'bp', 3000 + 2500 * rnd(), 1.2), f2 = biquad(sr, 'bp', 900 + 500 * rnd(), 1);
+      let env = 0;
+      for (let i = 0; i < L; i++) { if (rnd() < 0.004) env = 0.4 + rnd(); env *= 0.9965; const t = i / L; const n = gauss() * (env + 0.12) * Math.sin(Math.PI * t); y[i] = f(n) + f2(n) * 0.4; }
+      B.rustle.push(norm(y));
+    }
+    yield;
+    // The performer's own shoes on the stage boards.
+    B.step = [];
+    for (let b = 0; b < 10; b++) {
+      const L = Math.floor(0.16 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 110 + 60 * rnd(), 4), f2 = biquad(sr, 'bp', 1700 + 900 * rnd(), 3), f3 = biquad(sr, 'bp', 420 + 200 * rnd(), 6);
+      for (let i = 0; i < L; i++) { const t = i / sr; const n = gauss(); y[i] = f1(n) * 1.6 * Math.exp(-t / 0.03) + f2(n) * 0.5 * Math.exp(-t / 0.004) + f3(n) * 0.8 * Math.exp(-t / 0.02); }
+      B.step.push(norm(y));
+    }
+    yield;
+    // A board that creaks under you, now and then.
+    B.creak = [];
+    for (let b = 0; b < 4; b++) {
+      const L = Math.floor(0.35 * sr), y = new Float32Array(L), f0 = 180 + 160 * rnd(); let ph = 0, env = 0;
+      const r1 = biquad(sr, 'bp', 900 + 500 * rnd(), 8), r2 = biquad(sr, 'bp', 2200 + 700 * rnd(), 10);
+      for (let i = 0; i < L; i++) { const t = i / L; const f = f0 * (1 + 0.25 * Math.sin(t * 3.1)); ph += f / sr; if (ph >= 1) { ph -= 1; env = 1; } env *= 0.9; const pulse = env * Math.sin(Math.PI * t); y[i] = r1(pulse) + 0.6 * r2(pulse); }
+      B.creak.push(norm(y));
+    }
+    yield;
+    // Roses landing: a soft thud and cellophane.
+    B.flower = [];
+    for (let b = 0; b < 5; b++) {
+      const L = Math.floor(0.4 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 140, 2), f2 = biquad(sr, 'hp', 3500, 0.7); let env = 0;
+      for (let i = 0; i < L; i++) { const t = i / sr; if (rnd() < 0.01 * Math.exp(-t / 0.08)) env = 1; env *= 0.97; const n = gauss(); y[i] = f1(n) * 2 * Math.exp(-t / 0.03) + f2(n) * env * 0.5; }
+      B.flower.push(norm(y));
+    }
+    yield;
+    // The follow-spot: a heavy switch and the lamp's hum settling.
+    B.clunk = [];
+    for (let b = 0; b < 2; b++) {
+      const L = Math.floor(0.9 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 95, 4), f2 = biquad(sr, 'bp', 1300, 3), f3 = biquad(sr, 'bp', 3400, 5);
+      for (let i = 0; i < L; i++) { const t = i / sr; const n = gauss() * (t < 0.004 ? 1 : 0.04);
+        y[i] = f1(n) * 3 * Math.exp(-t / 0.08) + f2(n) * Math.exp(-t / 0.02) + f3(n) * 0.5 * Math.exp(-t / 0.01) + 0.012 * Math.sin(TAU * 100 * t) * Math.min(1, t * 8) * Math.exp(-t / 0.5) + (t > 0.03 && t < 0.035 ? f2(gauss()) * 0.6 : 0); }
+      B.clunk.push(norm(y));
+    }
+    yield;
+    // The orchestra in the pit applauds the old way: bows tapped on music stands.
+    B.bowtap = [];
+    for (let b = 0; b < 12; b++) {
+      const L = Math.floor(0.05 * sr), y = new Float32Array(L), f1 = biquad(sr, 'bp', 2200 + 1800 * rnd(), 9), f2 = biquad(sr, 'bp', 5200 + 1500 * rnd(), 6);
+      for (let i = 0; i < L; i++) { const t = i / sr; const n = gauss() * (t < 0.0008 ? 1 : 0.02); y[i] = f1(n) * Math.exp(-t / 0.012) + f2(n) * 0.5 * Math.exp(-t / 0.004); }
+      B.bowtap.push(norm(y));
+    }
+    yield;
+    // Wordless shouts for the roar: woo, yeah, ohh, hey. Many short voices at scattered pitches: never one held note.
+    B.shout = [];
+    const kinds = [['u', 'o', (u, p) => p * (1 + 0.35 * Math.sin(Math.PI * Math.min(1, u * 1.4)))], ['e', 'a', (u, p) => p * (1.15 - 0.3 * u)], ['o', 'o', (u, p) => p * (1 + 0.2 * Math.sin(Math.PI * u))], ['e', 'e', (u, p) => p * (1.1 - 0.1 * u)], ['ae', 'a', (u, p) => p * (1.2 - 0.35 * u)]];
+    for (let b = 0; b < 56; b++) {
+      const female = rnd() < 0.5, [v0, v1, fn] = kinds[b % kinds.length], p0 = female ? 280 + 140 * rnd() : 150 + 90 * rnd();
+      const dur = [0.75, 0.5, 0.85, 0.3, 0.55][b % kinds.length] * (0.8 + 0.5 * rnd());
+      B.shout.push(norm(voice(sr, dur, u => fn(u, p0), v0, v1, female, 0.35 + 0.3 * rnd())));
+      if ((b & 7) === 7) yield;
+    }
+    // And for the one who's had enough: a single boo from the gallery.
+    B.boo = [];
+    for (let b = 0; b < 3; b++) { const p0 = 135 + 25 * rnd(); B.boo.push(norm(voice(sr, 1.15 + 0.3 * rnd(), u => p0 * (1.05 - 0.28 * u) * (u < 0.08 ? 0.9 + u : 1), 'u', 'u', false, 0.25))); }
+    yield;
+    // Your own heart, in the silence before anyone claps: lub-dub, felt more than heard.
+    B.heart = [];
+    for (let b = 0; b < 3; b++) {
+      const L = Math.floor(0.42 * sr), y = new Float32Array(L);
+      for (let i = 0; i < L; i++) { const t = i / sr;
+        const lub = Math.sin(TAU * (52 + 6 * b) * t) * Math.exp(-t / 0.045) * smooth(0, 0.008, t);
+        const t2 = t - 0.24, dub = t2 > 0 ? Math.sin(TAU * 64 * t2) * Math.exp(-t2 / 0.035) * smooth(0, 0.006, t2) * 0.7 : 0;
+        y[i] = lub + dub; }
+      B.heart.push(norm(y));
+    }
+    B.done = true;
+  }
+
+  // The hall's impulse response: frequency-dependent decay (the bass lingers), with early reflections off the
+  // parapets. An empty hall rings longer than a full one: bodies absorb sound.
+  function* hallIRGen(sr, rt, out) {
+    const len = Math.floor(rt * 1.7 * sr), chans = [new Float32Array(len), new Float32Array(len)];
+    const bands = [[90, 1.25], [250, 1.15], [700, 1.0], [2000, 0.85], [5000, 0.6], [10000, 0.38]];
+    for (let ch = 0; ch < 2; ch++) {
+      const d = chans[ch];
+      for (const [fc, k] of bands) { const f = biquad(sr, 'bp', fc, 1.1); const T = rt * k; for (let i = 0; i < len; i++) { const t = i / sr; d[i] += f(gauss()) * Math.exp(-6.9 * t / T) * smooth(0.008, 0.04, t); } yield; }
+      for (let r = 0; r < 30; r++) { const at = Math.floor((0.012 + 0.11 * Math.pow(rnd(), 1.4)) * sr); d[at] += (rnd() < 0.5 ? -1 : 1) * 0.9 * Math.exp(-r / 12); }
+      let e = 0; for (const v of d) e += v * v; const sc = 1 / Math.sqrt(e); for (let i = 0; i < len; i++) d[i] *= sc;
+    }
+    out.push(chans);
+  }
+  function irBuffer(ctx, chans) { const b = ctx.createBuffer(2, chans[0].length, ctx.sampleRate); b.copyToChannel(chans[0], 0); b.copyToChannel(chans[1], 1); return b; }
+
+  // ── everything that can be made before anyone taps is made in small slices, so the first tap never stalls ──
+  const SR0 = 48000, PRE = { banks: {}, irs: [] };
+  const work = [makeBanks(SR0, PRE.banks), hallIRGen(SR0, 1.55, PRE.irs), hallIRGen(SR0, 2.6, PRE.irs)];
+  function prepareSome(ms) { const t0 = performance.now(); while (work.length && performance.now() - t0 < ms) { if (work[0].next().done) work.shift(); } return !work.length; }
+  (function tick() { if (!prepareSome(10)) setTimeout(tick, 16); })();
+
+  // The engine runs in an AudioWorklet where it can; where it can't (an older browser, or a sandbox that refuses the
+  // module), the very same processor runs on the main thread inside a ScriptProcessor.
+  function scriptProcessorEngine(ctx, banks) {
+    let Cls = null;
+    const Base = class { constructor() { this.port = null; } };
+    new Function('AudioWorkletProcessor', 'registerProcessor', 'sampleRate', WORKLET_SRC)(Base, (n, c) => { Cls = c; }, ctx.sampleRate);
+    const proc = new Cls({ processorOptions: { banks, zones: NZ } });
+    const sp = ctx.createScriptProcessor(1024, 1, 4);
+    const L = new Float32Array(128), R = new Float32Array(128), SL = new Float32Array(128), SR = new Float32Array(128), outs = [[L, R], [SL, SR]];
+    sp.onaudioprocess = e => {
+      const ob = e.outputBuffer, o = [0, 1, 2, 3].map(c => ob.getChannelData(c));
+      let f = Math.round(e.playbackTime * ctx.sampleRate);
+      for (let off = 0; off < ob.length; off += 128) {
+        L.fill(0); R.fill(0); SL.fill(0); SR.fill(0); proc.frame = f; proc.process([], outs);
+        o[0].set(L, off); o[1].set(R, off); o[2].set(SL, off); o[3].set(SR, off); f += 128;
+      }
+    };
+    const split = ctx.createChannelSplitter(4), dry = ctx.createChannelMerger(2), send = ctx.createChannelMerger(2);
+    sp.connect(split); split.connect(dry, 0, 0); split.connect(dry, 1, 1); split.connect(send, 2, 0); split.connect(send, 3, 1);
+    const silent = ctx.createConstantSource ? ctx.createConstantSource() : null; if (silent) { silent.offset.value = 0; silent.connect(sp); silent.start(); }
+    return { port: { postMessage: m => proc.msg(m) }, dry, send, kind: 'script' };
+  }
+
+  // ── start (must be called from a user gesture) ────────
+  let starting = null;
+  let keeper = null, keeperOn = false;
+  function keepAwakeAudio() { // iOS: a playing <audio> element moves Web Audio out of the ringer-switch's "ambient" category
+    if (keeperOn) return;
+    try {
+      if (!keeper) { keeper = document.createElement('audio'); keeper.setAttribute('playsinline', ''); keeper.loop = true; keeper.volume = 0.01;
+        keeper.src = 'data:audio/wav;base64,UklGRiwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQgAAACAgICAgICAgA=='; }
+      const p = keeper.play(); if (p && p.then) p.then(() => { keeperOn = true; }).catch(() => {});
+    } catch (e) {}
+  }
+  function start() {
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+    keepAwakeAudio();                                     // retried on every gesture until it takes
+    if (A.ctx) { if (A.ctx.state !== 'running') A.ctx.resume().catch(() => {}); return starting || Promise.resolve(); }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { A.failed = true; return Promise.resolve(); }
+    let ctx; try { ctx = new AC({ latencyHint: 'interactive', sampleRate: SR0 }); } catch (e) { ctx = new AC(); }
+    A.ctx = ctx; A.sr = ctx.sampleRate;
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    starting = boot(ctx).catch(e => { console.warn('audio unavailable:', e && e.message); try { ctx.close(); } catch (_) {} A.ctx = null; A.ready = false; A.failed = true; starting = null; });
+    return starting;
+  }
+  async function boot(ctx) {
+    prepareSome(1e9);                                     // finish whatever the slices haven't done yet
+    let banks = PRE.banks, irs = PRE.irs;
+    if (ctx.sampleRate !== SR0) { banks = {}; for (const _ of makeBanks(ctx.sampleRate, banks)); irs = []; for (const _ of hallIRGen(ctx.sampleRate, 1.55, irs)); for (const _ of hallIRGen(ctx.sampleRate, 2.6, irs)); }
+    let engine = null;
+    if (ctx.audioWorklet && typeof AudioWorkletNode !== 'undefined' && !/engine=script/.test(location.search)) {
+      for (const url of [URL.createObjectURL(new Blob([WORKLET_SRC], { type: 'text/javascript' })), 'worklet.js']) {
+        try { await ctx.audioWorklet.addModule(url); const n = new AudioWorkletNode(ctx, 'house', { numberOfInputs: 0, numberOfOutputs: 2, outputChannelCount: [2, 2], processorOptions: { banks, zones: NZ } }); engine = { port: n.port, dry: n, send: n, node: n, kind: 'worklet' }; break; }
+        catch (e) { /* try the next way */ }
+      }
+    }
+    if (!engine) engine = scriptProcessorEngine(ctx, banks);
+    A.engine = engine; A.node = { port: engine.port };
+    const master = A.master = ctx.createGain(); master.gain.value = 0;
+    const full = ctx.createConvolver(); full.normalize = false; full.buffer = irBuffer(ctx, irs[0]);
+    const empty = ctx.createConvolver(); empty.normalize = false; empty.buffer = irBuffer(ctx, irs[1]);
+    const wetFull = A.wetFull = ctx.createGain(), wetEmpty = A.wetEmpty = ctx.createGain(); wetFull.gain.value = 0.55; wetEmpty.gain.value = 0;
+    const dry = ctx.createGain(); dry.gain.value = 1;
+    if (engine.kind === 'worklet') { engine.node.connect(dry, 0); engine.node.connect(full, 1); engine.node.connect(empty, 1); }
+    else { engine.dry.connect(dry); engine.send.connect(full); engine.send.connect(empty); }
+    full.connect(wetFull); empty.connect(wetEmpty);
+    const bus = ctx.createGain(); dry.connect(bus); wetFull.connect(bus); wetEmpty.connect(bus);
+    const muf = A.muf = ctx.createBiquadFilter(); muf.type = 'lowpass'; muf.frequency.value = 20000; muf.Q.value = 0.5;
+    const lim = ctx.createDynamicsCompressor(); lim.threshold.value = -3; lim.knee.value = 2; lim.ratio.value = 12; lim.attack.value = 0.002; lim.release.value = 0.18;
+    bus.connect(muf); muf.connect(master); master.connect(lim); lim.connect(ctx.destination);
+    master.gain.setTargetAtTime(A.level, ctx.currentTime, 0.9);
+    A.ready = true;
+  }
+  A.running = () => !!(A.ctx && A.ready && A.ctx.state === 'running');
+
+  // ── scheduling ─────────────────────────────────────────
+  // modelNow: the model's clock at the moment being displayed. Events carry model times a little in the future.
+  function schedule(events, modelNow, listener) {
+    if (!A.running()) { events.length = 0; A.offset = null; return; }
+    const ctx = A.ctx, sr = A.sr;
+    const off = ctx.currentTime - modelNow;
+    if (A.offset === null || Math.abs(off - A.offset) > 0.08) A.offset = off; else A.offset += (off - A.offset) * 0.02;
+    const base = A.offset + 0.03;
+    const out = []; let n = 0;
+    for (const ev of events) {
+      const i = ev.i;
+      let frame, bank = ID[ev.type], idx = 0, zone = -1, pan = 0, g = ev.g;
+      if (ev.type === 'clap' || ev.type === 'stamp' || ev.type === 'thunk' || ev.type === 'whistle' || ev.type === 'cough' || ev.type === 'shout' || ev.type === 'boo') {
+        const p = P[i];
+        const dx = p.x - listener.x, dz = p.z - PERF_Z, dy = p.y + 1.2 - (STAGE_Y + EYE), d = Math.hypot(dx, dy, dz);
+        frame = (ev.t + d / 343 + base) * sr;
+        const dd = 2.6 / (1 + d * 0.22);   // direct sound: row A is ~8 dB above the back of the stalls; the reverb carries the far field
+        if (ev.type === 'clap') {
+          idx = (i * 7 + ((Math.random() * 3) | 0) * 41) % 128; g *= 0.3 * dd * (0.85 + 0.3 * Math.random()) * (1 + 0.9 * (listener.surge || 0)); zone = zoneOf[i];
+          // the nearest hands, each in its own place: you can pick out the people in the first rows
+          if (p.dist < 11.5 && p.tier === 0) { zone = -1; pan = clamp(-Math.sin(Math.atan2(dx, dz) - listener.yaw) * 1.3, -1, 1); g *= 1.8; }
+        }
+        else if (ev.type === 'stamp') { idx = i % 16; g *= 0.11 * dd; zone = zoneOf[i]; }
+        else if (ev.type === 'thunk') { idx = (i * 3 + ((Math.random() * 20) | 0)) % 20; g *= 0.16 * dd; zone = zoneOf[i]; }
+        else { // voices of the house: whistles and coughs are placed individually
+          idx = (Math.random() * 60) | 0; pan = clamp(-Math.sin(Math.atan2(dx, dz) - listener.yaw) * 1.1, -1, 1);   // screen-right is world −x
+          g *= (ev.type === 'whistle' ? 0.13 : ev.type === 'shout' ? 0.075 : ev.type === 'boo' ? 0.22 : 0.1) / (1 + d * 0.05);
+        }
+      } else {
+        frame = ((ev.t == null ? modelNow : ev.t) + base) * sr; idx = (Math.random() * 20) | 0; pan = ev.pan || 0; zone = ev.zone == null ? -1 : ev.zone;
+      }
+      out.push(frame, bank, idx, zone, g, pan); n++;
+    }
+    events.length = 0;
+    if (n) A.node.port.postMessage({ type: 'ev', data: new Float64Array(out), names: NAMES });
+  }
+
+  function fx(type, g, pan, dryish) { if (!A.running()) return; const off = A.offset == null ? 0 : A.offset; schedule([{ t: A.ctx.currentTime - off + 0.05, type, g, pan: pan || 0, zone: dryish ? -2 : -1 }], A.ctx.currentTime - off, { x: 0, yaw: 0 }); }
+
+  // ── the listener moves: re-pan and re-filter each zone ─────────────
+  let zoneMsgT = 0;
+  function update(dt, listener, crowdS, dir) {
+    if (!A.running()) return;
+    const ctx = A.ctx, sr = A.sr;
+    zoneMsgT -= dt;
+    if (zoneMsgT <= 0) {
+      zoneMsgT = 0.05;
+      const data = new Float32Array(NZ * 4);
+      for (let k = 0; k < NZ; k++) {
+        const z = zones[k]; if (!z.n) continue;
+        const dx = z.x - listener.x, dz = z.z - PERF_Z, dy = z.y - (STAGE_Y + EYE), d = Math.hypot(dx, dy, dz);
+        const az = Math.atan2(dx, dz) - listener.yaw, pan = clamp(-Math.sin(az) * 1.15, -1, 1);
+        const behind = Math.cos(az) < 0 ? 0.6 : 1;
+        const g = behind;
+        const fc = 15000 * Math.exp(-Math.max(0, d - 5) / 22);
+        data[k * 4] = g * Math.sqrt((1 - pan) / 2); data[k * 4 + 1] = g * Math.sqrt((1 + pan) / 2);
+        data[k * 4 + 2] = Math.exp(-TAU * fc / sr); data[k * 4 + 3] = 0.22;
+      }
+      A.node.port.postMessage({ type: 'zones', data });
+      // room tone and murmur follow the phase of the night
+      const ph = dir.phase, lights = ph === 'preshow' ? 0 : 1;
+      const murmur = ph === 'leaving' ? 0.05 * (1 - crowdS.leaving) + 0.01 : ph === 'lights' || ph === 'breath' ? 0 : ph === 'ovation' ? 0.004 * (1 - Math.min(1, crowdS.frac * 4)) : 0;
+      A.node.port.postMessage({ type: 'amb', room: 0.006 * lights * (ph === 'end' ? 0 : 1), murmur, cheer: 0 });
+    }
+    // off in the wings the house is behind a wall of scenery and drapes
+    const muf = clamp((Math.abs(listener.x) - (WING_X - 0.6)) / 2.2, 0, 1);
+    A.muf.frequency.setTargetAtTime(20000 * Math.pow(0.05, muf), ctx.currentTime, 0.12);
+    // people absorb sound: as the house empties it rings longer
+    A.wetFull.gain.setTargetAtTime(0.55 * (1 - crowdS.leaving * 0.8), ctx.currentTime, 0.5);
+    A.wetEmpty.gain.setTargetAtTime(0.75 * crowdS.leaving, ctx.currentTime, 0.5);
+    A.master.gain.setTargetAtTime(dir.phase === 'end' ? 0 : A.level * (1 - 0.25 * muf), ctx.currentTime, 0.3);
+  }
+
+  return Object.assign(A, { start, schedule, update, fx, zoneOf, NZ });
+}
+
+// ───────── gl.js ─────────
+// gl.js — a thin WebGL2 kit: programs with cached uniforms, buffers, render targets, a full-screen triangle.
+
+function createGL(canvas) {
+  const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: true, stencil: false, premultipliedAlpha: false, powerPreference: 'high-performance', preserveDrawingBuffer: false });
+  if (!gl) return null;
+  const floatRT = !!gl.getExtension('EXT_color_buffer_float') || !!gl.getExtension('EXT_color_buffer_half_float');
+  gl.getExtension('OES_texture_float_linear');
+
+  function shader(type, src) {
+    const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(s), lines = src.split('\n');
+      const m = /ERROR: \d+:(\d+)/.exec(log); const ln = m ? +m[1] : 0;
+      throw new Error('shader: ' + log + '\n' + lines.slice(Math.max(0, ln - 3), ln + 2).map((l, k) => (ln - 2 + k) + ': ' + l).join('\n'));
+    }
+    return s;
+  }
+  function program(vs, fs) {
+    const p = gl.createProgram();
+    gl.attachShader(p, shader(gl.VERTEX_SHADER, vs)); gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('link: ' + gl.getProgramInfoLog(p));
+    const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+    for (let i = 0; i < n; i++) { const info = gl.getActiveUniform(p, i); u[info.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, info.name); }
+    p.u = u; return p;
+  }
+  function buffer(data, usage) { const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, data, usage || gl.STATIC_DRAW); return b; }
+  // attribs: [{buf, loc, size, stride, offset, divisor, type}]
+  function vao(attribs, index) {
+    const v = gl.createVertexArray(); gl.bindVertexArray(v);
+    for (const a of attribs) {
+      gl.bindBuffer(gl.ARRAY_BUFFER, a.buf); gl.enableVertexAttribArray(a.loc);
+      gl.vertexAttribPointer(a.loc, a.size, a.type || gl.FLOAT, false, a.stride || 0, a.offset || 0);
+      if (a.divisor) gl.vertexAttribDivisor(a.loc, a.divisor);
+    }
+    if (index) { const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index, gl.STATIC_DRAW); }
+    gl.bindVertexArray(null); return v;
+  }
+  function texture(w, h, internal, format, type, filter) {
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter || gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter || gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    return t;
+  }
+  function target(w, h, withDepth) {
+    const t = makeTarget(w, h, withDepth, floatRT);
+    if (t.ok || !floatRT) return t;
+    t.free(); return makeTarget(w, h, withDepth, false);
+  }
+  function makeTarget(w, h, withDepth, hdr) {
+    const tex = texture(w, h, hdr ? gl.RGBA16F : gl.RGBA8, gl.RGBA, hdr ? gl.HALF_FLOAT : gl.UNSIGNED_BYTE);
+    const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    let depth = null;
+    if (withDepth) { depth = texture(w, h, gl.DEPTH_COMPONENT24, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, gl.NEAREST); gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, depth, 0); }
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { tex, fbo, depth, w, h, ok, free() { gl.deleteTexture(tex); if (depth) gl.deleteTexture(depth); gl.deleteFramebuffer(fbo); } };
+  }
+  // a multisampled colour+depth target to draw the scene into; resolved into a texture target afterwards
+  function msaaTarget(w, h, samples, hdr) {
+    const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const c = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, c); gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, hdr ? gl.RGBA16F : gl.RGBA8, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, c);
+    const d = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, d); gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, d);
+    const ok = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fbo, w, h, ok, free() { gl.deleteRenderbuffer(c); gl.deleteRenderbuffer(d); gl.deleteFramebuffer(fbo); } };
+  }
+  const tri = vao([{ buf: buffer(new Float32Array([-1, -1, 3, -1, -1, 3])), loc: 0, size: 2 }]);
+  const FS_VERT = `#version 300 es
+layout(location=0) in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos * .5 + .5; gl_Position = vec4(aPos, 0., 1.); }`;
+  function fullscreen() { gl.bindVertexArray(tri); gl.drawArrays(gl.TRIANGLES, 0, 3); }
+  return { gl, floatRT, program, buffer, vao, texture, target, msaaTarget, fullscreen, FS_VERT, maxSamples: gl.getParameter(gl.MAX_SAMPLES) || 0 };
+}
+
+// ───────── render.js ─────────
+// render.js — the house, the people in it, the light in the air.
+
+const LIGHT_GLSL = `
+uniform float uStage, uSpot, uHouse, uChand, uTime, uBow, uExposure;
+uniform vec3 uCam, uPerf, uBooth, uChandPos;
+// Light arriving at a point in the auditorium: the stage wash spilling out over the pit, the footlights raking up into
+// the front rows, the house lights and chandelier (only at the end), a little ambient so the dark stays readable.
+vec3 houseLight(vec3 p, vec3 n) {
+  vec3 Ls = vec3(uPerf.x * .4, 7.5, -3.5); vec3 d = Ls - p; float r2 = dot(d, d); vec3 l = d * inversesqrt(r2);
+  vec3 stage = vec3(1., .72, .48) * uStage * 70. / (r2 + 25.) * exp(-sqrt(r2) * .07) * max(0., dot(n, l) * .75 + .25);
+  vec3 Lf = vec3(clamp(p.x, -6.5, 6.5), 1.25, .1); d = Lf - p; r2 = dot(d, d); l = d * inversesqrt(r2);
+  vec3 foot = vec3(1., .58, .32) * uStage * 6. / (r2 + 4.) * max(0., dot(n, l) * .7 + .3);
+  vec3 hl = vec3(1., .8, .58) * uHouse * (.5 + .5 * n.y) * 1.25;
+  vec3 Lc = uChandPos - p; r2 = dot(Lc, Lc);
+  vec3 ch = vec3(1., .78, .52) * uChand * 140. / (r2 + 40.) * max(0., dot(n, Lc * inversesqrt(r2)) * .6 + .4);
+  vec3 amb = vec3(.016, .011, .009) * (.7 + .3 * n.y) * (1. + uStage);
+  return stage + foot + hl + ch + amb;
+}
+float sq(float x) { return x * x; }
+float hash12(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * .1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+float vnoise(vec2 p) { vec2 i = floor(p), f = fract(p); f = f * f * (3. - 2. * f);
+  return mix(mix(hash12(i), hash12(i + vec2(1, 0)), f.x), mix(hash12(i + vec2(0, 1)), hash12(i + vec2(1, 1)), f.x), f.y); }
+`;
+
+function createRenderer(canvas, house) {
+  const K = createGL(canvas);
+  if (!K) return null;
+  const { gl } = K;
+  const R = { K, gl, w: 0, h: 0, dpr: 1, scale: 1 };
+
+  // ─────────────────────────── geometry of the hall ───────────────────────────
+  const V = [], I = []; // pos3 nrm3 uv2 mat1
+  const vert = (p, n, u, v, m) => { V.push(p[0], p[1], p[2], n[0], n[1], n[2], u, v, m); return V.length / 9 - 1; };
+  function quad(a, b, c, d, m, uv) { // a b c d counter-clockwise, normal from winding
+    const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], e2 = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+    let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]]; const l = Math.hypot(...n) || 1; n = n.map(x => x / l);
+    uv = uv || [0, 0, 1, 0, 1, 1, 0, 1];
+    const i0 = vert(a, n, uv[0], uv[1], m), i1 = vert(b, n, uv[2], uv[3], m), i2 = vert(c, n, uv[4], uv[5], m), i3 = vert(d, n, uv[6], uv[7], m);
+    I.push(i0, i1, i2, i0, i2, i3);
+  }
+  // an oriented box: centre, half-extents along (right, up, forward) with forward = (fx, 0, fz)
+  function box(cx, cy, cz, hw, hh, hd, fx, fz, m, faces) {
+    const rx = fz, rz = -fx; // right = up × forward (in plan)
+    const P = (sx, sy, sz) => [cx + rx * hw * sx + fx * hd * sz, cy + hh * sy, cz + rz * hw * sx + fz * hd * sz];
+    const F = faces || 'fbtlr';
+    if (F.includes('f')) quad(P(1, -1, 1), P(-1, -1, 1), P(-1, 1, 1), P(1, 1, 1), m);
+    if (F.includes('b')) quad(P(-1, -1, -1), P(1, -1, -1), P(1, 1, -1), P(-1, 1, -1), m);
+    if (F.includes('t')) quad(P(-1, 1, 1), P(-1, 1, -1), P(1, 1, -1), P(1, 1, 1), m);
+    if (F.includes('l')) quad(P(-1, -1, -1), P(-1, -1, 1), P(-1, 1, 1), P(-1, 1, -1), m);
+    if (F.includes('r')) quad(P(1, -1, 1), P(1, -1, -1), P(1, 1, -1), P(1, 1, 1), m);
+  }
+  // stage and pit
+  quad([-11, STAGE_Y, 0.3], [11, STAGE_Y, 0.3], [11, STAGE_Y, -13], [-11, STAGE_Y, -13], 0, [-11, 0.3, 11, 0.3, 11, -13, -11, -13]);
+  quad([-11, -2.2, 0.3], [-11, STAGE_Y, 0.3], [11, STAGE_Y, 0.3], [11, -2.2, 0.3], 11);           // stage front
+  quad([-11, -1.4, 0.3], [11, -1.4, 0.3], [11, -1.4, 3.0], [-11, -1.4, 3.0], 11);                 // pit floor (an orchestra lift)
+  quad([11, -2.2, 3.0], [11, 0.95, 3.0], [-11, 0.95, 3.0], [-11, -2.2, 3.0], 13, [11, 0, 11, 1, -11, 1, -11, 0]); // pit rail wall
+  quad([-11, 0.95, 3.0], [11, 0.95, 3.0], [11, 0.95, 3.18], [-11, 0.95, 3.18], 4);                // rail top
+  // stalls floor, raked
+  quad([-12.6, -0.05, 3.1], [12.6, -0.05, 3.1], [12.6, 2.3, 26], [-12.6, 2.3, 26], 1, [-12.6, 3.1, 12.6, 3.1, 12.6, 26, -12.6, 26]);
+  // tiers: parapet, soffit, box walls, partitions, back walls
+  HOUSE.tiers.forEach((top, ti) => {
+    const c0 = horseshoeCurve(0), cB = horseshoeCurve(3.3), step = 0.5;
+    const nextTop = ti < 3 ? HOUSE.tiers[ti + 1] : HOUSE.ceilingY + 1.05;
+    for (let s = 0; s < c0.length - 1e-3; s += step) {
+      const s2 = Math.min(c0.length, s + step), a = c0.at(s), b = c0.at(s2);
+      if (a.z < HOUSE.sideZ0 + 0.1 && b.z < HOUSE.sideZ0 + 0.1) continue;
+      const fa = s / c0.length * cB.length, fb = s2 / c0.length * cB.length, A2 = cB.at(fa), B2 = cB.at(fb);
+      const y0 = top - 1.08, y1 = top;
+      // parapet face (towards the stage), with a rounded rail on top
+      quad([a.x, y0, a.z], [b.x, y0, b.z], [b.x, y1, b.z], [a.x, y1, a.z], 3, [s, 0, s2, 0, s2, 1, s, 1]);
+      quad([a.x, y1, a.z], [b.x, y1, b.z], [b.x - b.nx * .28, y1 + .02, b.z - b.nz * .28], [a.x - a.nx * .28, y1 + .02, a.z - a.nz * .28], 4, [s, 0, s2, 0, s2, 1, s, 1]);
+      // soffit (the underside of the tier, which the stage light washes from below)
+      quad([a.x, y0 - .18, a.z], [A2.x, y0 - .18, A2.z], [B2.x, y0 - .18, B2.z], [b.x, y0 - .18, b.z], 6, [s, 0, s, 1, s2, 1, s2, 0]);
+      quad([b.x, y0 - .18, b.z], [b.x, y0, b.z], [a.x, y0, a.z], [a.x, y0 - .18, a.z], 3, [s2, -.2, s2, 0, s, 0, s, -.2]);
+      // back wall of the tier, up to the next soffit
+      quad([B2.x, y0, B2.z], [A2.x, y0, A2.z], [A2.x, nextTop - 1.26, A2.z], [B2.x, nextTop - 1.26, B2.z], 5, [fb, y0, fa, y0, fa, nextTop, fb, nextTop]);
+      // tier floor
+      quad([a.x, y0 - 0.02, a.z], [b.x, y0 - 0.02, b.z], [B2.x, y0 + 0.9, B2.z], [A2.x, y0 + 0.9, A2.z], 5, [s, 0, s2, 0, s2, 1, s, 1]);
+    }
+    // box partitions on the sides
+    if (ti < 3) for (let s = 0; s < c0.length; s += 2.5) {
+      const a = c0.at(s); if (a.z > HOUSE.backCz || a.z < HOUSE.sideZ0 + 0.3) continue; const A2 = cB.at(s / c0.length * cB.length);
+      const y0 = top - 1.08, y1 = nextTop - 1.26;
+      quad([a.x, y0, a.z], [A2.x, y0, A2.z], [A2.x, y1, A2.z], [a.x, y1, a.z], 12, [0, 0, 1, 0, 1, 1, 0, 1]);
+      quad([A2.x, y0, A2.z], [a.x, y0, a.z], [a.x, y1, a.z], [A2.x, y1, A2.z], 12, [1, 0, 0, 0, 0, 1, 1, 1]);
+    }
+  });
+  // stalls walls under the first tier and the proscenium walls
+  {
+    const cw = horseshoeCurve(0.2); const step = 0.6;
+    for (let s = 0; s < cw.length - 1e-3; s += step) {
+      const a = cw.at(s), b = cw.at(Math.min(cw.length, s + step));
+      quad([b.x, -0.3, b.z], [a.x, -0.3, a.z], [a.x, HOUSE.tiers[0] - 1.26, a.z], [b.x, HOUSE.tiers[0] - 1.26, b.z], 5, [s + step, 0, s, 0, s, 3, s + step, 3]);
+    }
+    for (const sx of [-1, 1]) {
+      const x = sx * (HOUSE.sideX + 0.2);
+      quad([x, -0.3, -1.0], [x, -0.3, HOUSE.sideZ0], [x, HOUSE.ceilingY, HOUSE.sideZ0], [x, HOUSE.ceilingY, -1.0], 8);
+      // proscenium pillar and arch
+      box(sx * 8.1, (STAGE_Y + 15) / 2, -0.9, 0.9, (15 - STAGE_Y) / 2, 0.5, 0, 1, 9, 'f'); box(sx * 8.1, (STAGE_Y + 15) / 2, -0.9, 0.9, (15 - STAGE_Y) / 2, 0.5, 0, 1, 11, 'blr');
+      quad([sx * 8.1 + sx * 0.9, STAGE_Y, -0.4], [sx * 12.6, STAGE_Y, -0.4], [sx * 12.6, 17, -0.4], [sx * 8.1 + sx * 0.9, 17, -0.4], 9);
+    }
+    box(0, 13.9, -0.9, 9, 1.1, 0.5, 0, 1, 9, 'fb');
+    // house curtain: gathered drapes and a swagged valance, deep red velvet
+    for (const sx of [-1, 1]) quad([sx * 7.2, STAGE_Y, -1.5], [sx * 5.9, STAGE_Y, -1.5], [sx * 6.6, 12.8, -1.5], [sx * 7.2, 12.8, -1.5], 10, [0, 0, 1, 0, 1, 1, 0, 1]);
+    quad([-7.3, 11.4, -1.52], [7.3, 11.4, -1.52], [7.3, 12.9, -1.52], [-7.3, 12.9, -1.52], 10, [0, 0, 8, 0, 8, 1, 0, 1]);
+    // ceiling
+    quad([-13, HOUSE.ceilingY, -1], [-13, HOUSE.ceilingY, 30], [13, HOUSE.ceilingY, 30], [13, HOUSE.ceilingY, -1], 7, [-13, -1, -13, 30, 13, 30, 13, -1]);
+    // wings: black masking and the upstage wall
+    quad([-11, STAGE_Y, -13], [11, STAGE_Y, -13], [11, 16, -13], [-11, 16, -13], 11);
+    for (const sx of [-1, 1]) for (let k = 0; k < 3; k++) { const z = -6.4 - k * 3.0; quad([sx * 11, STAGE_Y, z - 1.4], [sx * 11, STAGE_Y, z + 0.4], [sx * 11, 14, z + 0.4], [sx * 11, 14, z - 1.4], 11); box(sx * 8.8, 7.5, z, 0.9, 6.4, 0.05, 0, 1, 11, 'fb'); }
+  }
+  const hallV = new Float32Array(V), hallI = new Uint32Array(I);
+  const hallBuf = K.buffer(hallV);
+  const hallVao = K.vao([
+    { buf: hallBuf, loc: 0, size: 3, stride: 36, offset: 0 }, { buf: hallBuf, loc: 1, size: 3, stride: 36, offset: 12 },
+    { buf: hallBuf, loc: 2, size: 2, stride: 36, offset: 24 }, { buf: hallBuf, loc: 3, size: 1, stride: 36, offset: 32 }], hallI);
+  const hallCount = hallI.length;
+
+  // ─────────────────────────── tip-up seats (instanced: the cushion folds up when nobody's on it) ───────────────────────────
+  // one seat in local coordinates: x right, y up, z forward (toward the stage); flag 1 = the cushion, which hinges at its back
+  const SV = [], SI = [];
+  function sbox(cx, cy, cz, hw, hh, hd, m, faces, flag) {
+    const P = (sx, sy, sz) => [cx + hw * sx, cy + hh * sy, cz + hd * sz];
+    const q = (a, b, c, d) => { const e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], e2 = [d[0] - a[0], d[1] - a[1], d[2] - a[2]];
+      let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]]; const l = Math.hypot(...n) || 1; n = n.map(x => x / l);
+      const base = SV.length / 10; for (const v of [a, b, c, d]) SV.push(v[0], v[1], v[2], n[0], n[1], n[2], m, flag, v[0], v[1]); SI.push(base, base + 1, base + 2, base, base + 2, base + 3); };
+    if (faces.includes('f')) q(P(1, -1, 1), P(-1, -1, 1), P(-1, 1, 1), P(1, 1, 1));
+    if (faces.includes('b')) q(P(-1, -1, -1), P(1, -1, -1), P(1, 1, -1), P(-1, 1, -1));
+    if (faces.includes('t')) q(P(-1, 1, 1), P(-1, 1, -1), P(1, 1, -1), P(1, 1, 1));
+    if (faces.includes('u')) q(P(-1, -1, -1), P(-1, -1, 1), P(1, -1, 1), P(1, -1, -1));
+    if (faces.includes('l')) q(P(-1, -1, -1), P(-1, -1, 1), P(-1, 1, 1), P(-1, 1, -1));
+    if (faces.includes('r')) q(P(1, -1, 1), P(1, -1, -1), P(1, 1, -1), P(1, 1, 1));
+  }
+  sbox(0, 0.64, -0.28, 0.21, 0.27, 0.04, 2, 'ftlr', 0);          // backrest
+  sbox(0, 0.925, -0.28, 0.215, 0.018, 0.05, 14, 'ftb', 0);        // wooden top rail
+  sbox(0.255, 0.6, -0.05, 0.025, 0.03, 0.2, 14, 'tlrf', 0);       // armrest
+  sbox(0, 0.43, -0.02, 0.2, 0.05, 0.2, 2, 'ftul', 1);             // cushion
+  const seatList = house.seats, NS = seatList.length;
+  const seatStatic = new Float32Array(NS * 4), seatTip = new Float32Array(NS);
+  seatList.forEach((st, k) => { seatStatic.set([st.x, st.y, st.z, Math.atan2(st.fx, st.fz)], k * 4); seatTip[k] = st.occupied ? 0 : 1; });
+  const svBuf = K.buffer(new Float32Array(SV)), ssBuf = K.buffer(seatStatic), stBuf = K.buffer(seatTip, gl.DYNAMIC_DRAW);
+  const seatVao = K.vao([
+    { buf: svBuf, loc: 0, size: 3, stride: 40, offset: 0 }, { buf: svBuf, loc: 1, size: 3, stride: 40, offset: 12 },
+    { buf: svBuf, loc: 2, size: 2, stride: 40, offset: 24 }, { buf: svBuf, loc: 3, size: 2, stride: 40, offset: 32 },
+    { buf: ssBuf, loc: 4, size: 4, stride: 16, offset: 0, divisor: 1 }, { buf: stBuf, loc: 5, size: 1, divisor: 1 }], new Uint16Array(SI));
+  const seatIdx = SI.length;
+  const SEAT_VS = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aMF; layout(location=3) in vec2 aUv;
+layout(location=4) in vec4 aSeat; layout(location=5) in float aTip;
+uniform mat4 uVP; out vec3 vPos; out vec3 vNrm; out vec2 vUv; flat out int vMat;
+void main(){
+  vec3 p = aPos, n = aNrm;
+  if (aMF.y > .5) { // fold the cushion up about its back edge
+    float a = aTip * 1.35; vec3 h = vec3(0., .43, -.2); vec3 q = p - h; float c = cos(a), s = sin(a);
+    p = h + vec3(q.x, q.y * c + q.z * s, -q.y * s + q.z * c); n = vec3(n.x, n.y * c + n.z * s, -n.y * s + n.z * c);
+  }
+  float ca = cos(aSeat.w), sa = sin(aSeat.w);     // local z → the seat's facing (fx, fz) = (sin w, cos w)
+  vec3 w = vec3(p.x * ca + p.z * sa, p.y, -p.x * sa + p.z * ca) + aSeat.xyz;
+  vPos = w; vNrm = vec3(n.x * ca + n.z * sa, n.y, -n.x * sa + n.z * ca); vUv = aUv * 3.; vMat = int(aMF.x + .5);
+  gl_Position = uVP * vec4(w, 1.);
+}`;
+  const HALL_FS = `#version 300 es
+precision highp float;
+in vec3 vPos; in vec3 vNrm; in vec2 vUv; flat in int vMat; out vec4 oCol;
+${LIGHT_GLSL}
+uniform float uWing, uSpotX, uTorch; uniform vec3 uTorchP;
+// the performer's shadow, cast down-stage by a low backlight, as a pair of capsules that bend when you bow
+float segDist(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
+  vec3 d1 = p1 - p0, d2 = q1 - q0, r = p0 - q0; float a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r), c = dot(d1, r), b = dot(d1, d2);
+  float den = a * e - b * b; float s = den > 1e-6 ? clamp((b * f - c * e) / den, 0., 1.) : 0.; float t = (b * s + f) / e;
+  if (t < 0.) { t = 0.; s = clamp(-c / a, 0., 1.); } else if (t > 1.) { t = 1.; s = clamp((b - c) / a, 0., 1.); }
+  return length((p0 + d1 * s) - (q0 + d2 * t));
+}
+float perfShadow(vec3 p) {
+  vec3 L = vec3(uPerf.x, uPerf.y + 5.2, uPerf.z - 8.5);
+  vec3 f = uPerf; float a = uBow * 1.05; vec3 fw = vec3(0., cos(a), sin(a)), side = vec3(1., 0., 0.);
+  vec3 hip = f + vec3(0., .95, 0.), chest = hip + fw * .5, sh = hip + fw * .56, head = hip + fw * .82;
+  float d = segDist(p, L, f + vec3(-.1, .05, 0.), hip - side * .08) - .075;
+  d = min(d, segDist(p, L, f + vec3(.1, .05, 0.), hip + side * .08) - .075);
+  d = min(d, segDist(p, L, hip, chest) - .15);
+  d = min(d, segDist(p, L, sh - side * .19, sh + side * .19) - .07);
+  d = min(d, segDist(p, L, sh - side * .21, hip - side * .24 + fw * .05 + vec3(0., -.15, .05)) - .045);
+  d = min(d, segDist(p, L, sh + side * .21, hip + side * .24 + fw * .05 + vec3(0., -.15, .05)) - .045);
+  d = min(d, segDist(p, L, head, head + fw * .01) - .105);
+  return smoothstep(-.03, .07, d);
+}
+vec3 velvet(vec3 base, vec3 n, vec3 v) { float sheen = pow(1. - max(0., dot(n, v)), 3.); return base * (.65 + .35 * max(0., dot(n, v))) + base * 1.6 * sheen; }
+void main(){
+  vec3 n = normalize(vNrm), v = normalize(uCam - vPos);
+  if (dot(n, v) < 0. && vMat != 0) n = -n;
+  vec3 alb = vec3(.2); float spec = 0.; float emis = 0.; vec3 ecol = vec3(0.);
+  vec3 L = houseLight(vPos, n);
+  if (vMat == 0) { // stage boards: planks running up- and down-stage, worn wax, the spot's pool, your shadow from the backlight
+    float plank = floor(vUv.x / .14); float g = vnoise(vec2(vUv.x * 30., vUv.y * 1.3 + plank * 7.1));
+    alb = mix(vec3(.13, .075, .045), vec3(.23, .14, .08), g) * (.8 + .4 * hash12(vec2(plank, 3.)));
+    float seam = smoothstep(.062, .069, abs(fract(vUv.x / .14) - .5) * .14); float butt = smoothstep(.985, 1., fract(vUv.y / 2.4 + hash12(vec2(plank, 9.))));
+    alb *= 1. - .6 * max(seam, butt);
+    vec2 dp = (vPos.xz - vec2(uSpotX, uPerf.z)) * vec2(1., .8); float pool = exp(-dot(dp, dp) / 1.1) * uSpot;
+    vec2 db = (vPos.xz - uPerf.xz - vec2(0., 2.6)) * vec2(.45, .3); float back = exp(-dot(db, db)) * uStage;
+    float wash = uStage * .25 * exp(-dot(vPos.xz - vec2(0., -3.), vPos.xz - vec2(0., -3.)) / 60.);
+    L = vec3(1., .88, .74) * pool * 1.5 + vec3(.95, .8, .62) * back * 1.1 * perfShadow(vPos) + vec3(1., .8, .6) * wash * .6 + L * .1;
+    vec2 tq = (vPos.xz - uTorchP.xy); tq = vec2(dot(tq, vec2(cos(uTorchP.z), sin(uTorchP.z))), dot(tq, vec2(-sin(uTorchP.z), cos(uTorchP.z)))) * vec2(1.4, 3.2);
+    L += vec3(.42, .6, 1.) * uTorch * 5.5 * smoothstep(1., .5, dot(tq, tq) * 2.2);
+    L += vec3(.3, .42, .95) * (.12 + .25 * uWing) * exp(-sq(abs(vPos.x) - 10.) * .35) * (exp(-sq(vPos.z + 2.4) * .25) + exp(-sq(vPos.z + 6.2) * .25));
+    vec3 hv = normalize(normalize(vec3(uSpotX, 8., 29.) - vPos) + v); spec = 0.;
+    ecol = vec3(1., .85, .65) * pow(max(0., hv.y), 60.) * (pool * .6 + back * .25);
+    } else if (vMat == 1) { alb = vec3(.13, .03, .03) * (.8 + .2 * vnoise(vUv * 3.)); }
+  else if (vMat == 2) { alb = velvet(vec3(.25, .022, .032), n, v) * (.85 + .15 * vnoise(vPos.xz * 9.)); }
+  else if (vMat == 3 || vMat == 9 || vMat == 12) { // ivory plaster and gilt: framed panels, rosettes, hanging garlands, mouldings
+    vec2 uv = vMat == 3 ? vUv : (vMat == 12 ? vUv * vec2(1.2, 2.4) : vec2(vPos.x + vPos.z, vPos.y) * 1.1);
+    float pw = 1.25; vec2 q = vec2(fract(uv.x / pw) - .5, uv.y - .5);
+    float frame = smoothstep(.012, 0., abs(abs(q.x) - .45)) * step(abs(q.y), .36) + smoothstep(.012, 0., abs(abs(q.y) - .36)) * step(abs(q.x), .45);
+    float r = length(q * vec2(1., 1.3)), an = atan(q.y, q.x);
+    float petals = 1. - smoothstep(.0, .012, r - .085 * (.72 + .28 * cos(an * 8.)));
+    float ring = smoothstep(.012, 0., abs(r - .13));
+    float sag = .27 - .16 * (1. - sq(q.x / .4));
+    float swag = smoothstep(.02, 0., abs(q.y - sag)) * step(abs(q.x), .4) * step(.16, abs(q.x));
+    float tassel = smoothstep(.02, 0., length(vec2(abs(q.x) - .42, q.y - .22)) - .018);
+    float mould = (smoothstep(.03, 0., abs(uv.y - .93)) + smoothstep(.03, 0., abs(uv.y - .07))) * (.6 + .4 * step(0., sin(uv.x * 42.)));
+    float gold = clamp(frame + petals + ring + swag + tassel + mould, 0., 1.);
+    vec3 ivory = vec3(.78, .69, .55), gld = vec3(1., .7, .3);
+    alb = mix(ivory, gld * .85, gold);
+    spec = gold * 1.5;
+    L += vec3(1., .74, .5) * uStage * .09 * max(0., -n.z * .8 + .2);   // the stage's glow, reflected back into the room
+  }
+  else if (vMat == 4) { alb = velvet(vec3(.4, .04, .05), n, v); }
+  else if (vMat == 5) { // box interiors: red damask, lamp-warm
+    float dam = vnoise(vUv * vec2(3., 4.)) * .5 + .5 * smoothstep(.4, .6, vnoise(vUv * vec2(6., 8.) + 3.));
+    alb = vec3(.3, .05, .045) * (.75 + .35 * dam);
+    // a small lamp every box: warm pools on the back wall
+    float lamp = exp(-sq((fract(vUv.x / 2.5) - .5) * 2.5) * 3.) * exp(-sq(vUv.y - (floor(vUv.y) + .8)) * 1.5);
+    L += vec3(1., .6, .3) * (.18 + .35 * uHouse) * lamp;
+  }
+  else if (vMat == 6) { // soffits: pale plaster with gilt coffers
+    vec2 q = fract(vec2(vUv.x / 1.25, vUv.y * 1.6)) - .5; float cof = smoothstep(.36, .4, max(abs(q.x), abs(q.y)));
+    float rose = 1. - smoothstep(.05, .07, length(q));
+    alb = mix(vec3(.3, .22, .16), vec3(.8, .56, .26), max(cof, rose)); spec = max(cof, rose) * .9;
+  }
+  else if (vMat == 7) { // the ceiling: a painted sky in a ring round the chandelier
+    vec2 c = vUv - vec2(0., 14.8); float r = length(c); vec2 u = c / max(r, 1e-3);
+    float paint = vnoise(u * 3.2 + r * .45) * .6 + vnoise(u * 8. + r * 1.3 + 4.) * .4;
+    vec3 col = mix(vec3(.2, .28, .45), vec3(.7, .38, .25), smoothstep(.3, .8, paint));
+    col = mix(col, vec3(.55, .45, .2), smoothstep(.55, .9, vnoise(u * 2. + r * .25 + 9.)));
+    alb = mix(vec3(.55, .48, .38), col * .8, smoothstep(9.5, 8.5, r) * smoothstep(2.5, 3.5, r));
+    alb = mix(alb, vec3(.9, .65, .3), smoothstep(.15, 0., abs(r - 9.8)) + smoothstep(.12, 0., abs(r - 3.2)));
+    L += vec3(1., .75, .5) * uStage * .12;
+  }
+  else if (vMat == 8) { alb = vec3(.26, .05, .045) * (.8 + .3 * vnoise(vPos.zy * 2.)); }
+  else if (vMat == 10) { // curtain velvet with deep folds
+    float fold = sin(vUv.x * 40.) * .5 + .5; alb = vec3(.42, .03, .05) * (.35 + .9 * fold);
+    alb = velvet(alb, normalize(n + vec3(cos(vUv.x * 40.) * .5, 0., 0.)), v);
+  }
+  else if (vMat == 11) { alb = vec3(.02); L += vec3(.3, .4, .8) * .5 * smoothstep(7.5, 11., abs(vPos.x)) * exp(-sq(vPos.y - 2.5) * .05) * step(vPos.z, -1.); }
+  else if (vMat == 14) { alb = vec3(.09, .05, .03); spec = .25; }
+  else if (vMat == 13) { // the pit rail, lit from below by a row of music-stand lamps
+    alb = vec3(.07, .035, .025) * (.7 + .3 * vnoise(vUv * vec2(4., 30.))); spec = .1;
+    float stand = exp(-sq((fract(vUv.x / 1.15 + .3) - .5) * 3.2)) * (.6 + .4 * hash12(vec2(floor(vUv.x / 1.15 + .3), 5.)));
+    L += vec3(1., .72, .42) * uStage * (stand * 1.4 + .25) * smoothstep(1.02, .62, vUv.y);
+  }
+  vec3 col = alb * L + ecol;
+  // gilt glints: a sharp highlight toward the stage light, sparkling as the ornament's facets turn
+  if (spec > 0.) {
+    vec3 Ls = normalize(vec3(uPerf.x * .4, 7.5, -3.5) - vPos); vec3 h = normalize(Ls + v);
+    float facet = hash12(floor(vPos.xz * 9.) + floor(vPos.y * 9.) * 7.);
+    float s = pow(max(0., dot(n, h)), 30.) * (.4 + 1.6 * facet) + pow(max(0., dot(reflect(-v, n), normalize(uChandPos - vPos))), 20.) * uChand * 2.;
+    col += vec3(1., .78, .45) * spec * s * (uStage * .9 + uHouse * .7 + .05);
+  }
+  oCol = vec4(col, 1.);
+}`;
+  const hallProg = K.program(`#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNrm; layout(location=2) in vec2 aUv; layout(location=3) in float aMat;
+uniform mat4 uVP; out vec3 vPos; out vec3 vNrm; out vec2 vUv; flat out int vMat;
+void main(){ vPos = aPos; vNrm = aNrm; vUv = aUv; vMat = int(aMat + .5); gl_Position = uVP * vec4(aPos, 1.); }`, HALL_FS);
+  const seatProg = K.program(SEAT_VS, HALL_FS);
+
+  // ─────────────────────────── the audience ───────────────────────────
+  const P = house.people, N = house.N;
+  const NI = N + 1;                       // + the conductor, on the podium in the pit, facing you
+  const statics = new Float32Array(NI * 8);
+  const srng = makeRng(4242);
+  for (let i = 0; i < N; i++) {
+    const p = P[i];
+    // skin, hair colour, hair style, clothes, build, glasses — a house full of different people
+    statics.set([p.x, p.y, p.z, srng(), srng(), srng(), srng(), srng()], i * 8);
+  }
+  statics.set([-1.35, -1.12, 2.55, -1.03, 0.22, 0.8, 0.2, 0.55], N * 8);
+  const dyn = new Float32Array(NI * 8);
+  const qBuf = K.buffer(new Float32Array([-1, 0, 1, 0, -1, 1, 1, 1]));
+  const sBuf = K.buffer(statics), dBuf = K.buffer(dyn, gl.DYNAMIC_DRAW);
+  const crowdVao = K.vao([
+    { buf: qBuf, loc: 0, size: 2 },
+    { buf: sBuf, loc: 1, size: 4, stride: 32, offset: 0, divisor: 1 }, { buf: sBuf, loc: 2, size: 4, stride: 32, offset: 16, divisor: 1 },
+    { buf: dBuf, loc: 3, size: 4, stride: 32, offset: 0, divisor: 1 }, { buf: dBuf, loc: 4, size: 4, stride: 32, offset: 16, divisor: 1 }]);
+
+  const crowdProg = K.program(`#version 300 es
+layout(location=0) in vec2 aQ; layout(location=1) in vec4 aP; layout(location=2) in vec4 aR; layout(location=3) in vec4 aD; layout(location=4) in vec4 aE;
+uniform mat4 uVP; uniform vec3 uRight; uniform float uNight;
+${LIGHT_GLSL}
+out vec2 vL; out vec4 vR; out vec4 vD; out vec4 vE; out vec3 vLight; out float vRim; out float vSeed; out float vPx; out float vCond;
+void main(){
+  // aD: handSep, flash, stand, arms   aE: gaze, leave, slide, clap
+  float standH = aD.z, leave = aE.y;
+  vec3 base = vec3(aP.x, aP.y + .43 + standH * .5, aP.z);
+  base += vec3(aE.z, 0., aE.w);                       // on the way out
+  float W = .38, H0 = -.42 - .55 * standH, H1 = 1.42;
+  vL = vec2(aQ.x * W, mix(H0, H1, aQ.y));
+  vec3 wp = base + uRight * vL.x + vec3(0., vL.y, 0.);
+  gl_Position = uVP * vec4(wp, 1.);
+  vCond = step(aP.w, -.5);
+  vR = vCond > .5 ? aR : fract(aR + uNight * vec4(.6180, .7548, .5698, .4302)); vD = aD; vE = aE; vSeed = vCond > .5 ? -aP.w - 1. : fract(aP.w + uNight * .3183);
+  vec3 facing = normalize(vec3(uPerf.x - aP.x, 0., uPerf.z - aP.z));
+  vec3 lp = vec3(aP.x, aP.y + 1.1 + standH * .45, aP.z);
+  vLight = houseLight(lp, normalize(facing + vec3(0., .25, 0.)));
+  vRim = 0.;
+  vec4 c = uVP * vec4(base + vec3(0., .8, 0.), 1.); vPx = 1. / max(.001, c.w);
+}`,
+  `#version 300 es
+precision highp float;
+in vec2 vL; in vec4 vR; in vec4 vD; in vec4 vE; in vec3 vLight; in float vRim; in float vSeed; in float vPx; in float vCond; out vec4 oCol;
+uniform float uTime, uHouseL;
+float sdE(vec2 p, vec2 r){ float k0 = length(p / r); float k1 = length(p / (r * r)); return k0 * (k0 - 1.) / max(k1, 1e-5); }
+float sdCap(vec2 p, vec2 a, vec2 b, float r){ vec2 pa = p - a, ba = b - a; float h = clamp(dot(pa, ba) / dot(ba, ba), 0., 1.); return length(pa - ba * h) - r; }
+float smin(float a, float b, float k){ float h = clamp(.5 + .5 * (b - a) / k, 0., 1.); return mix(b, a, h) - k * h * (1. - h); }
+vec3 hsl(float h, float s, float l){ vec3 rgb = clamp(abs(mod(h * 6. + vec3(0, 4, 2), 6.) - 3.) - 1., 0., 1.); return l + s * (rgb - .5) * (1. - abs(2. * l - 1.)); }
+void main(){
+  vec2 p = vL;
+  float build = vR.w, sw = .19 + .05 * build;             // shoulder half-width
+  float leave = vE.y, back = step(.001, leave);            // leaving: we see their backs
+  float gaze = (fract(vE.x) - .5) / .49 * (1. - back), shoutO = floor(vE.x) / 7.;
+  // head and neck
+  vec2 hc = vec2(gaze * .025, .83);
+  float head = sdE(p - hc, vec2(.082, .104));
+  float neck = sdCap(p, vec2(0., .62), vec2(0., .74), .045);
+  // torso: shoulders rounding into a trunk, clothes
+  float torso = sdCap(p, vec2(-sw + .08, .6), vec2(sw - .08, .6), .085);
+  vec2 tp = p - vec2(0., .1); float taper = sw - .02 - (.5 - clamp(tp.y, -.7, .5)) * .06;
+  float standing = vD.z, bottom = mix(-.72, -.14, smoothstep(.2, .8, standing));
+  torso = smin(torso, max(abs(tp.x) - taper, max(tp.y - .5, bottom - tp.y)), .1);
+  float legs = 1e3;
+  if (standing > .2) { float lw = .07; legs = min(sdCap(p, vec2(-.08, -.05), vec2(-.09, -.9), lw), sdCap(p, vec2(.08, -.05), vec2(.09, -.9), lw)); }
+  float body = min(smin(torso, neck, .03), legs);
+  // arms: at rest along the sides; clapping, forearms up and hands meeting in front of the chest; cheering, above the head
+  float clapping = step(1.5, vD.w), sep = vD.x, arms = vD.w - 2. * clapping;
+  float far = smoothstep(.018, .034, 1.2 / (vPx * 700.)); arms *= 1. - far;
+  float handY = mix(.57, 1.14, arms) + .02 * sin(vSeed * 50.);
+  vec2 hl = vec2(-.02 - sep * .045, handY), hr = vec2(.02 + sep * .045, handY);
+  vec2 el = vec2(-sw + .005, mix(.3, .84, arms)), er = vec2(sw - .005, mix(.3, .84, arms));
+  float armL, armR, hands;
+  if (clapping < .5 && arms > .05) { // both arms up, hands open
+    vec2 al = vec2(-sw - .1 * arms, mix(.4, 1.2, arms)), ar = vec2(sw + .1 * arms, mix(.4, 1.2, arms));
+    armL = sdCap(p, vec2(-sw + .05, .56), al, .045); armR = sdCap(p, vec2(sw - .05, .56), ar, .045);
+    hands = min(sdE(p - al - vec2(0., .05), vec2(.03, .05)), sdE(p - ar - vec2(0., .05), vec2(.03, .05)));
+  } else if (clapping > .5) {
+    armL = min(sdCap(p, vec2(-sw + .05, .56), el, .052), sdCap(p, el, hl + vec2(0., -.03), .04));
+    armR = min(sdCap(p, vec2(sw - .05, .56), er, .052), sdCap(p, er, hr + vec2(0., -.03), .04));
+    vec2 ql = p - hl - vec2(0., .02), qr = p - hr - vec2(0., .02); ql = mat2(.94, -.34, .34, .94) * ql; qr = mat2(.94, .34, -.34, .94) * qr;
+    hands = min(sdE(ql, vec2(.024, .05)), sdE(qr, vec2(.024, .05)));
+  } else {
+    armL = sdCap(p, vec2(-sw + .04, .56), vec2(-sw - .02, .1), .052); armR = sdCap(p, vec2(sw - .04, .56), vec2(sw + .02, .1), .052);
+    hands = 1e3;
+  }
+  float phoneA = vD.y >= 2. ? vD.y - 2. : 0.; float flashV = vD.y >= 2. ? 0. : vD.y;
+  float phoneS = 1e3;
+  if (phoneA > .02) { vec2 pc = vec2(.02 + .05 * sin(vSeed * 9.), mix(.5, 1.2, phoneA)); phoneS = max(abs(p.x - pc.x) - .038, abs(p.y - pc.y) - .066) - .006;
+    armR = min(armR, sdCap(p, vec2(sw - .05, .56), pc + vec2(0., -.04), .04)); }
+  float baton = vCond > .5 ? sdCap(p, hr + vec2(.01, .03), hr + vec2(.13, .2), .006) : 1e3;
+  float d = min(min(min(body, head), min(min(armL, armR), min(hands, phoneS))), baton);
+  // hair: styles from cropped to long, a few buns, a few bald heads
+  float style = vR.z, hcol = vR.y;
+  float hair = 1e3;
+  if (style < .35) hair = sdE(p - hc - vec2(0., .035), vec2(.088, .085));
+  else if (style < .6) hair = smin(sdE(p - hc - vec2(0., .03), vec2(.094, .095)), sdCap(p, hc + vec2(-.07, 0.), hc + vec2(-.08, -.16), .04), .03), hair = smin(hair, sdCap(p, hc + vec2(.07, 0.), hc + vec2(.08, -.16), .04), .03);
+  else if (style < .72) hair = min(sdE(p - hc - vec2(0., .03), vec2(.09, .088)), length(p - hc - vec2(0., .13)) - .05);
+  else if (style < .95) hair = sdE(p - hc - vec2(0., .045), vec2(.086, .075));
+  float faceMask = sdE(p - hc - vec2(gaze * .01, -.022), vec2(.064, .08));
+  if (back < .5) hair = max(hair, -faceMask);
+  d = min(d, hair);
+  float px = 1.2 / (vPx * 700.) + .002;                      // ~ one pixel in local metres
+  float a = 1. - smoothstep(-px, px, d);
+  if (a < .02) discard;
+  // colours
+  vec3 skin = mix(vec3(.96, .76, .62), vec3(.36, .22, .14), pow(vR.x, 1.3));
+  vec3 hairC = hcol < .35 ? vec3(.05, .035, .03) : hcol < .6 ? vec3(.22, .13, .07) : hcol < .75 ? vec3(.55, .42, .25) : hcol < .9 ? vec3(.6, .58, .56) : vec3(.45, .16, .06);
+  float cl = fract(vSeed * 7.13);
+  vec3 cloth = cl < .55 ? vec3(.035, .035, .045) : cl < .7 ? vec3(.06, .07, .13) : cl < .8 ? vec3(.12, .1, .09) : hsl(fract(vSeed * 3.7), .55, .28);
+  float shirt = (cl < .55 && fract(vSeed * 13.) < .45) ? 1. - smoothstep(.0, .01, abs(p.x) - (.62 - p.y) * .22) : 0.;
+  shirt *= step(.44, p.y) * step(p.y, .62) * (1. - back);
+  vec3 col = cloth;
+  col = mix(col, vec3(.62, .6, .56), shirt);
+  float isArm = step(min(armL, armR), 0.) * step(0., hands) * clapping;
+  col = mix(col, col * 1.45 + .012, isArm);
+  float cuff = clapping * step(.55, fract(vSeed * 13.)) * step(cl, .55) * (1. - step(0., min(sdCap(p, hl + vec2(0., -.045), hl + vec2(0., -.02), .03), sdCap(p, hr + vec2(0., -.045), hr + vec2(0., -.02), .03)))) * step(0., hands);
+  col = mix(col, vec3(.7, .68, .64), cuff);
+  float isSkin = 1. - step(0., min(min(head, neck), hands) - px * .5);
+  if (clapping < .5 && arms < .05) isSkin = 1. - step(0., min(head, neck) - px * .5);
+  col = mix(col, skin, isSkin);
+  float isHair = 1. - step(0., hair);
+  col = mix(col, hairC, isHair * (back > .5 ? 1. : 1.));
+  if (back > .5) col = mix(col, hairC, 1. - step(0., head));
+  // form: a sphere-ish face, cylinder-ish body
+  float shade = .62 + .38 * smoothstep(.0, .1, -d) ;
+  if (head < 0. && back < .5) { vec2 q = (p - hc) / vec2(.082, .104); float nz = sqrt(max(0., 1. - dot(q, q))); shade = .45 + .55 * nz;
+    // a hint of a face: brow shadow, eyes, glasses catching the light
+    vec2 e = vec2(abs(q.x - gaze * .35) - .36, q.y - .08);
+    float eyes = 1. - smoothstep(.0, .06, length(e * vec2(1., 1.7)) - .12);
+    float brow = smoothstep(.05, 0., abs(q.y - .27 - .05 * abs(q.x))) * step(abs(q.x - gaze * .3), .62);
+    float mouth = smoothstep(.05, 0., abs(q.y + .48)) * step(abs(q.x - gaze * .3), .25);
+    float open = 1. - smoothstep(0., .08, length((q - vec2(gaze * .3, -.47)) / vec2(.2, .07 + .2 * shoutO)) - 1.); mouth = max(mouth * (1. - shoutO), open * step(.05, shoutO));
+    float nose = smoothstep(.1, 0., abs(q.x - gaze * .45)) * step(-.3, q.y) * step(q.y, .05);
+    col *= (1. - .45 * eyes - .25 * brow - .3 * mouth) * (1. + .12 * nose);
+    if (fract(vSeed * 31.) < .1) col = mix(col, vec3(1., .95, .85), smoothstep(.03, 0., abs(length(e * vec2(1., 1.5)) - .16)) * .25);
+  }
+  if (baton < 0.) col = vec3(.9, .88, .82);
+  vec3 lit = col * vLight * shade;
+  // the clap: palms meet and catch the light
+  lit += skin * vLight * flashV * .5 * clapping * (1. - step(0., hands));
+  if (phoneS < 0.) lit = mix(vec3(.02), vec3(.75, .85, 1.) * 1.6, smoothstep(0., -.008, phoneS + .004));
+  oCol = vec4(lit, a * (1. - smoothstep(.9, 1., leave)));
+}`);
+
+  // the palms meeting: a tiny warm glint per clapper, never smaller than a pixel, so a house clapping in unison
+  // visibly pulses even at the back of the gods and even with the sound off
+  const glintProg = K.program(`#version 300 es
+layout(location=0) in vec2 aQ; layout(location=1) in vec4 aP; layout(location=2) in vec4 aR; layout(location=3) in vec4 aD; layout(location=4) in vec4 aE;
+uniform mat4 uVP; uniform vec3 uRight, uUp; uniform vec2 uRes;
+${LIGHT_GLSL}
+out vec2 vQ; out float vI; out vec3 vC;
+void main(){
+  float clapping = step(1.5, aD.w), arms = aD.w - 2. * clapping, flash = aD.y >= 2. ? 0. : aD.y;
+  float standH = aD.z;
+  vec3 base = vec3(aP.x, aP.y + .43 + standH * .5, aP.z) + vec3(aE.z, 0., aE.w);
+  vec3 hand = base + vec3(0., mix(.6, 1.18, arms), 0.);
+  vec4 c = uVP * vec4(hand, 1.);
+  float px = max(1.6, .045 * uRes.y / max(c.w, .1));          // at least ~1.5 px wide
+  vec2 off = aQ * vec2(1., 2.) - vec2(0., 1.);
+  c.xy += off * px / uRes * 2. * c.w;
+  gl_Position = clapping > .5 && flash > .06 && arms < .3 && aE.y < .01 ? c : vec4(2., 2., 2., 1.);
+  vQ = off; vI = flash * clapping;
+  vec3 lp = vec3(aP.x, aP.y + 1.1, aP.z);
+  vC = houseLight(lp, normalize(vec3(uPerf.x - aP.x, 2., uPerf.z - aP.z))) * vec3(1., .86, .66);
+}`, `#version 300 es
+precision highp float; in vec2 vQ; in float vI; in vec3 vC; out vec4 o;
+void main(){ float r = length(vQ); if (r > 1.) discard; o = vec4((vC + .06) * vI * (1. - r * r) * 4., 0.); }`);
+
+  // ─────────────────────────── small lights and flowers (sprites) ───────────────────────────
+  // lamps: footlights, box lamps, aisle lights, pit stands, the chandelier's crystals, the booth's lens, exit signs
+  const lamps = [];
+  for (let x = -6.6; x <= 6.61; x += 0.55) lamps.push([x, STAGE_Y + 0.06, 0.18, 0.05, 1.0, 0.62, 0.32, 0]);
+  HOUSE.tiers.forEach((top, ti) => { const c = horseshoeCurve(3.0); for (let s = 1.25; s < c.length; s += 2.5) { const a = c.at(s); if (a.z < HOUSE.sideZ0 + 0.3) continue; lamps.push([a.x, top - 1.08 + 1.55, a.z, 0.09, 1.0, 0.62, 0.3, 1]); } });
+  for (let r = 0; r < 21; r += 2) for (const sx of [-1, 1]) lamps.push([sx * 4.0, r * 0.105 + 0.05, 3.4 + r * 0.96, 0.035, 1.0, 0.55, 0.25, 2]);
+  const prng = makeRng(77); for (let k = 0; k < 34; k++) lamps.push([prng.range(-9, 9), -0.9, prng.range(0.7, 2.6), 0.05, 1.0, 0.8, 0.55, 3]);
+  const cc = HOUSE.chandelier; for (let k = 0; k < 420; k++) { const t = prng(), ring = Math.floor(t * 5), rr = 0.6 + ring * 0.42, a = prng() * TAU, y = cc[1] + 1.3 - ring * 0.5 - prng() * 0.3; lamps.push([cc[0] + Math.cos(a) * rr, y, cc[2] + Math.sin(a) * rr, 0.035 + 0.03 * prng(), 1.0, 0.85, 0.6, 4]); }
+  lamps.push([HOUSE.booth[0], HOUSE.booth[1], HOUSE.booth[2], 0.22, 1.0, 0.95, 0.85, 5]);
+  for (const sx of [-1, 1]) lamps.push([sx * 11.8, 2.7, 24, 0.12, 0.2, 1.0, 0.45, 6]);
+  const lampData = new Float32Array(lamps.flat());
+  const lBuf = K.buffer(lampData);
+  const lampVao = K.vao([{ buf: qBuf, loc: 0, size: 2 }, { buf: lBuf, loc: 1, size: 4, stride: 32, offset: 0, divisor: 1 }, { buf: lBuf, loc: 2, size: 4, stride: 32, offset: 16, divisor: 1 }]);
+  const lampProg = K.program(`#version 300 es
+layout(location=0) in vec2 aQ; layout(location=1) in vec4 aP; layout(location=2) in vec4 aC;
+uniform mat4 uVP; uniform vec3 uRight, uUp; uniform float uStage, uHouse, uChand, uSpot, uTime; uniform float uBoothPx;
+out vec2 vQ; out vec3 vCol;
+void main(){
+  int kind = int(aC.w + .5); float s = aP.w; float I = 1.;
+  if (kind == 0) I = uStage * 2.5;                  // footlights
+  else if (kind == 7) I = uStage * 2.;             // dust
+  else if (kind == 1) I = .45 + 1.6 * uHouse;       // box lamps
+  else if (kind == 2) I = .6 * (1. - uHouse * .5);  // aisle lights
+  else if (kind == 3) I = .9 * uStage;              // pit stand lights
+  else if (kind == 4) { I = (.06 + 3.5 * uChand) * (.6 + .4 * sin(uTime * (1. + fract(aP.x * 13.) * 3.) + aP.z * 40.)); }
+  else if (kind == 5) { I = 7. * uSpot; s = s * (1. + uBoothPx * .25); }
+  else if (kind == 6) I = .9;                       // exit signs
+  vec3 up = kind == 5 ? uUp : vec3(0., 1., 0.);
+  vec3 wp = aP.xyz + (uRight * aQ.x + up * (aQ.y * 2. - 1.)) * s;
+  gl_Position = uVP * vec4(wp, 1.); vQ = vec2(aQ.x, aQ.y * 2. - 1.); vCol = aC.rgb * I;
+}`, `#version 300 es
+precision highp float; in vec2 vQ; in vec3 vCol; out vec4 o;
+void main(){ float r = length(vQ); float a = exp(-r * r * 5.) + .25 * exp(-r * 2.5); if (r > 1.) discard; o = vec4(vCol * a, 0.); }`);
+
+  const torchData = new Float32Array(8), torchBuf = K.buffer(torchData, gl.DYNAMIC_DRAW);
+  const torchVao = K.vao([{ buf: qBuf, loc: 0, size: 2 }, { buf: torchBuf, loc: 1, size: 4, stride: 32, offset: 0, divisor: 1 }, { buf: torchBuf, loc: 2, size: 4, stride: 32, offset: 16, divisor: 1 }]);
+  // flowers: a rose in cellophane, as a little sprite with a stem
+  const FLW = 64, fd = new Float32Array(FLW * 8), flowerBuf = K.buffer(fd, gl.DYNAMIC_DRAW);
+  const flowerVao = K.vao([{ buf: qBuf, loc: 0, size: 2 }, { buf: flowerBuf, loc: 1, size: 4, stride: 32, offset: 0, divisor: 1 }, { buf: flowerBuf, loc: 2, size: 4, stride: 32, offset: 16, divisor: 1 }]);
+  const flowerProg = K.program(`#version 300 es
+layout(location=0) in vec2 aQ; layout(location=1) in vec4 aP; layout(location=2) in vec4 aC;
+uniform mat4 uVP; uniform vec3 uRight, uUp;
+${LIGHT_GLSL}
+out vec2 vQ; out float vHue; out vec3 vL; out float vFlat;
+void main(){ float rot = aP.w; mat2 m = mat2(cos(rot), sin(rot), -sin(rot), cos(rot)); vec2 q = vec2(aQ.x, aQ.y * 2. - 1.); vec2 r = m * q * .2;
+  float fl = aC.y; vec3 wp = aP.xyz + mix(uRight * r.x + uUp * r.y, vec3(r.x, .01, r.y), fl);
+  gl_Position = uVP * vec4(wp, 1.); vQ = q; vHue = aC.x; vFlat = fl;
+  vec2 dp = aP.xz - uPerf.xz; vL = houseLight(aP.xyz, vec3(0., 1., 0.)) * .6 + vec3(1., .86, .7) * uSpot * 2.5 * exp(-dot(dp, dp) / 2.6) + vec3(1., .8, .6) * uStage * .6; }`,
+  `#version 300 es
+precision highp float; in vec2 vQ; in float vHue; in vec3 vL; in float vFlat; out vec4 o;
+void main(){ vec2 q = vQ;
+  vec2 hq = (q - vec2(0., .5)) * vec2(1., 1.1); float hr = length(hq), ha = atan(hq.y, hq.x);
+  float head = hr - .33 * (.92 + .08 * cos(ha * 5. + 1.));
+  float sepal = max(abs(q.x) - .16 + (q.y - .2) * .5, abs(q.y - .2) - .06);
+  float stem = max(abs(q.x + q.y * .04) - .045, abs(q.y + .35) - .55);
+  float leaf1 = length((q - vec2(.15, -.18)) * vec2(1.2, 2.6)) - .11, leaf2 = length((q - vec2(-.14, -.46)) * vec2(1.2, 2.6)) - .1;
+  float d = min(min(head, sepal), min(stem, min(leaf1, leaf2))); if (d > 0.) discard;
+  vec3 c;
+  if (head < 0.) {
+    float petals = .5 + .5 * sin(hr * 30. - ha * 2.2), rim = smoothstep(-.05, 0., head);
+    vec3 deep = vHue < .9 ? vec3(.22, .005, .02) : vec3(.34, .3, .24), lit = vHue < .9 ? vec3(.62, .03, .07) : vec3(.55, .52, .44);
+    c = mix(deep, lit, petals * smoothstep(.34, .0, hr) * .9 + .1) * (1. - .5 * rim);
+  } else if (sepal < 0.) c = vec3(.03, .07, .03);
+  else c = vec3(.022, .05, .022) * ((leaf1 < 0. || leaf2 < 0.) ? 1.35 : 1.);
+  o = vec4(c * vL, 1.); }`);
+
+  // ─────────────────────────── the follow-spot's beam in the haze ───────────────────────────
+  const beamProg = K.program(K.FS_VERT, `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o;
+uniform sampler2D uDepth; uniform mat4 uInvVP; uniform vec3 uCam, uBooth, uTarget; uniform float uSpot, uTime, uNear, uFar, uHaze;
+float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+float vn(vec3 p){ vec3 i = floor(p), f = fract(p); f = f * f * (3. - 2. * f);
+  float n = i.x + i.y * 57. + i.z * 113.; vec4 a = fract(sin(vec4(n, n + 1., n + 57., n + 58.)) * 43758.5453), b = fract(sin(vec4(n + 113., n + 114., n + 170., n + 171.)) * 43758.5453);
+  vec4 m = mix(a, b, f.z); vec2 m2 = mix(m.xy, m.zw, f.y); return mix(m2.x, m2.y, f.x); }
+void main(){
+  if (uSpot < .01) { o = vec4(0.); return; }
+  vec4 ndc = vec4(vUv * 2. - 1., texture(uDepth, vUv).r * 2. - 1., 1.);
+  vec4 wp = uInvVP * ndc; wp /= wp.w; vec3 ro = uCam, rd = wp.xyz - ro; float tmax = length(rd); rd /= tmax; tmax = min(tmax, 60.);
+  vec3 axis = normalize(uTarget - uBooth); float lenAB = length(uTarget - uBooth); float tanA = 1.25 / lenAB;
+  const int STEPS = 28; float dt = tmax / float(STEPS); float j = hash(vUv * 731. + uTime); float acc = 0.;
+  for (int i = 0; i < STEPS; i++) {
+    float t = (float(i) + j) * dt; vec3 p = ro + rd * t; vec3 q = p - uBooth; float along = dot(q, axis);
+    if (along < .2) continue;
+    float r = length(q - axis * along), R = along * tanA;
+    float inside = smoothstep(R, R * .82, r);
+    float haze = .6 + .8 * vn(p * .7 + vec3(0., uTime * .05, uTime * .03));
+    acc += inside * haze / (1. + along * .02) * dt;
+  }
+  float g = .72, cosT = dot(-rd, -axis); float hg = (1. - g * g) / pow(1. + g * g - 2. * g * cosT, 1.5);
+  o = vec4(vec3(1., .9, .76) * min(acc, 20.) * uSpot * uHaze * (.0015 + .0009 * min(hg, 12.)), 0.);
+}`);
+  // dust motes turning in the beam right in front of you
+  const DUST = 600, dd = new Float32Array(DUST * 8), dustBuf = K.buffer(dd, gl.DYNAMIC_DRAW), dustSeed = makeRng(9);
+  const dust = []; for (let k = 0; k < DUST; k++) dust.push({ o: [dustSeed.range(-1.6, 1.6), dustSeed.range(0, 3.2), dustSeed.range(0.3, 9)], ph: dustSeed() * TAU, sp: 0.1 + dustSeed() * 0.3 });
+  const dustVao = K.vao([{ buf: qBuf, loc: 0, size: 2 }, { buf: dustBuf, loc: 1, size: 4, stride: 32, offset: 0, divisor: 1 }, { buf: dustBuf, loc: 2, size: 4, stride: 32, offset: 16, divisor: 1 }]);
+
+  // ─────────────────────────── post: bloom, tone, grain ───────────────────────────
+  const downProg = K.program(K.FS_VERT, `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o; uniform sampler2D uTex; uniform vec2 uTexel; uniform float uFirst, uLdr;
+void main(){ vec2 t = uTexel; vec3 c = texture(uTex, vUv).rgb * .5 + (texture(uTex, vUv + vec2(-t.x, -t.y)).rgb + texture(uTex, vUv + vec2(t.x, -t.y)).rgb + texture(uTex, vUv + vec2(-t.x, t.y)).rgb + texture(uTex, vUv + vec2(t.x, t.y)).rgb) * .125;
+  if (uFirst > .5) { float l = dot(c, vec3(.3, .5, .2)); c *= uLdr > .5 ? smoothstep(.55, 1., l) : smoothstep(.6, 2.5, l); }
+  o = vec4(c, 1.); }`);
+  const upProg = K.program(K.FS_VERT, `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o; uniform sampler2D uTex; uniform vec2 uTexel;
+void main(){ vec2 t = uTexel; vec3 c = (texture(uTex, vUv + vec2(-t.x, 0)).rgb + texture(uTex, vUv + vec2(t.x, 0)).rgb + texture(uTex, vUv + vec2(0, -t.y)).rgb + texture(uTex, vUv + vec2(0, t.y)).rgb) * .25; o = vec4(c, 1.); }`);
+  const finalProg = K.program(K.FS_VERT, `#version 300 es
+precision highp float; in vec2 vUv; out vec4 o; uniform sampler2D uTex, uBloom; uniform float uExposure, uFade, uTime, uGrain; uniform vec2 uRes;
+vec3 aces(vec3 x){ return clamp((x * (2.51 * x + .03)) / (x * (2.43 * x + .59) + .14), 0., 1.); }
+float hash(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+void main(){
+  vec3 c = texture(uTex, vUv).rgb + texture(uBloom, vUv).rgb * .55;
+  c *= uExposure;
+  vec2 q = vUv - .5; q.x *= uRes.x / uRes.y; float vig = 1. - .38 * dot(q, q) * 1.4;
+  c *= vig;
+  c = aces(c);
+  c = pow(c, vec3(1. / 2.2));
+  c = mix(c, c * vec3(1.03, .99, .93), .6);
+  c += (hash(vUv * uRes + fract(uTime * 17.) * 100.) - .5) * uGrain;
+  o = vec4(c * (1. - uFade), 1.);
+}`);
+
+  let scene = null, msaa = null, blooms = [];
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const small = Math.min(innerWidth, innerHeight) < 700;
+    R.dpr = small ? Math.min(dpr, 2) : Math.min(dpr, 1.5);
+    const w = Math.max(2, Math.floor(innerWidth * R.dpr)), h = Math.max(2, Math.floor(innerHeight * R.dpr));
+    if (w === R.w && h === R.h) return;
+    R.w = canvas.width = w; R.h = canvas.height = h;
+    if (scene) scene.free(); if (msaa) msaa.free(); msaa = null; blooms.forEach(b => b.free()); blooms = [];
+    scene = K.target(w, h, true);
+    const samples = Math.min(4, K.maxSamples);
+    if (samples > 1 && !/nomsaa/.test(location.search)) { const hdr = K.floatRT; msaa = K.msaaTarget(w, h, samples, hdr); if (!msaa.ok) { msaa.free(); msaa = null; } }
+    let bw = w >> 1, bh = h >> 1; for (let k = 0; k < 6 && bw > 4 && bh > 4; k++) { blooms.push(K.target(bw, bh, false)); bw >>= 1; bh >>= 1; }
+  }
+
+  // ─────────────────────────── per-frame ───────────────────────────
+  const view = { eye: [0, 0, 0], yaw: 0, pitch: 0, fovy: 1, vp: null, inv: null, right: [1, 0, 0], up: [0, 1, 0] };
+  function setUniformsLight(prog, L) {
+    const u = prog.u;
+    gl.uniform1f(u.uStage, L.stage); gl.uniform1f(u.uSpot, L.spot); gl.uniform1f(u.uHouse, L.house); gl.uniform1f(u.uChand, L.chand);
+    gl.uniform1f(u.uTime, L.time); gl.uniform1f(u.uBow, L.bow);
+    gl.uniform3fv(u.uCam, view.eye); gl.uniform3f(u.uPerf, L.perfX, STAGE_Y, PERF_Z); gl.uniform3fv(u.uBooth, HOUSE.booth); gl.uniform3fv(u.uChandPos, HOUSE.chandelier);
+  }
+  function invert(m) { // general 4×4 inverse
+    const inv = new Float32Array(16), a = m;
+    inv[0] = a[5] * a[10] * a[15] - a[5] * a[11] * a[14] - a[9] * a[6] * a[15] + a[9] * a[7] * a[14] + a[13] * a[6] * a[11] - a[13] * a[7] * a[10];
+    inv[4] = -a[4] * a[10] * a[15] + a[4] * a[11] * a[14] + a[8] * a[6] * a[15] - a[8] * a[7] * a[14] - a[12] * a[6] * a[11] + a[12] * a[7] * a[10];
+    inv[8] = a[4] * a[9] * a[15] - a[4] * a[11] * a[13] - a[8] * a[5] * a[15] + a[8] * a[7] * a[13] + a[12] * a[5] * a[11] - a[12] * a[7] * a[9];
+    inv[12] = -a[4] * a[9] * a[14] + a[4] * a[10] * a[13] + a[8] * a[5] * a[14] - a[8] * a[6] * a[13] - a[12] * a[5] * a[10] + a[12] * a[6] * a[9];
+    inv[1] = -a[1] * a[10] * a[15] + a[1] * a[11] * a[14] + a[9] * a[2] * a[15] - a[9] * a[3] * a[14] - a[13] * a[2] * a[11] + a[13] * a[3] * a[10];
+    inv[5] = a[0] * a[10] * a[15] - a[0] * a[11] * a[14] - a[8] * a[2] * a[15] + a[8] * a[3] * a[14] + a[12] * a[2] * a[11] - a[12] * a[3] * a[10];
+    inv[9] = -a[0] * a[9] * a[15] + a[0] * a[11] * a[13] + a[8] * a[1] * a[15] - a[8] * a[3] * a[13] - a[12] * a[1] * a[11] + a[12] * a[3] * a[9];
+    inv[13] = a[0] * a[9] * a[14] - a[0] * a[10] * a[13] - a[8] * a[1] * a[14] + a[8] * a[2] * a[13] + a[12] * a[1] * a[10] - a[12] * a[2] * a[9];
+    inv[2] = a[1] * a[6] * a[15] - a[1] * a[7] * a[14] - a[5] * a[2] * a[15] + a[5] * a[3] * a[14] + a[13] * a[2] * a[7] - a[13] * a[3] * a[6];
+    inv[6] = -a[0] * a[6] * a[15] + a[0] * a[7] * a[14] + a[4] * a[2] * a[15] - a[4] * a[3] * a[14] - a[12] * a[2] * a[7] + a[12] * a[3] * a[6];
+    inv[10] = a[0] * a[5] * a[15] - a[0] * a[7] * a[13] - a[4] * a[1] * a[15] + a[4] * a[3] * a[13] + a[12] * a[1] * a[7] - a[12] * a[3] * a[5];
+    inv[14] = -a[0] * a[5] * a[14] + a[0] * a[6] * a[13] + a[4] * a[1] * a[14] - a[4] * a[2] * a[13] - a[12] * a[1] * a[6] + a[12] * a[2] * a[5];
+    inv[3] = -a[1] * a[6] * a[11] + a[1] * a[7] * a[10] + a[5] * a[2] * a[11] - a[5] * a[3] * a[10] - a[9] * a[2] * a[7] + a[9] * a[3] * a[6];
+    inv[7] = a[0] * a[6] * a[11] - a[0] * a[7] * a[10] - a[4] * a[2] * a[11] + a[4] * a[3] * a[10] + a[8] * a[2] * a[7] - a[8] * a[3] * a[6];
+    inv[11] = -a[0] * a[5] * a[11] + a[0] * a[7] * a[9] + a[4] * a[1] * a[11] - a[4] * a[3] * a[9] - a[8] * a[1] * a[7] + a[8] * a[3] * a[5];
+    inv[15] = a[0] * a[5] * a[10] - a[0] * a[6] * a[9] - a[4] * a[1] * a[10] + a[4] * a[2] * a[9] + a[8] * a[1] * a[6] - a[8] * a[2] * a[5];
+    let det = a[0] * inv[0] + a[1] * inv[4] + a[2] * inv[8] + a[3] * inv[12]; det = 1 / det; for (let i = 0; i < 16; i++) inv[i] *= det; return inv;
+  }
+
+  function frame(cam, L, crowd, dir, tRender) {
+    resize();
+    if (!blooms.length || !scene || !scene.ok) return;
+    const aspect = R.w / R.h;
+    // camera
+    const fovy = aspect >= 1 ? lerp(0.98, 1.08, clamp((1.6 - aspect) / 0.6, 0, 1)) : lerp(1.1, 1.38, clamp((1 - aspect) / 0.55, 0, 1));
+    const fz = fovy * (cam.zoom || 1); view.fovy = fz; view.eye = cam.eye;
+    const cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch), cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw);
+    const fwd = [sy * cp, sp, cy * cp];
+    const at = [cam.eye[0] + fwd[0], cam.eye[1] + fwd[1], cam.eye[2] + fwd[2]];
+    const V = M4.lookAt(cam.eye, at, [cam.roll || 0, 1, 0]), Pm = M4.perspective(fz, aspect, 0.08, 120);
+    view.vp = M4.mul(Pm, V); view.inv = invert(view.vp);
+    view.right = [V[0], V[4], V[8]]; view.up = [V[1], V[5], V[9]];
+    // audience instance data
+    const nowT = tRender;
+    for (let i = 0; i < N; i++) {
+      const o = i * 8;
+      const clapping = crowd.clap[i] || (nowT - crowd.lastClap[i] < 0.3) ? 1 : 0;
+      // hand separation from the actual clap times: they close as a clap approaches, snap together, spring apart
+      let last = crowd.lastClap[i] <= nowT ? crowd.lastClap[i] : crowd.prevClap[i];
+      const f = 1 / Math.max(0.12, crowd.lastClap[i] - crowd.prevClap[i]);
+      const since = nowT - last, per = 1 / f;
+      const ph = clamp(since / per, 0, 1.5);
+      dyn[o] = clapping ? Math.min(1, Math.sin(Math.PI * Math.min(1, ph)) * 1.25) : 0;
+      dyn[o + 1] = (clapping ? Math.exp(-since * 40) : 0) + (crowd.phone[i] > 0.02 ? 2 + crowd.phone[i] : 0);
+      dyn[o + 2] = crowd.standH[i];
+      const p = P[i]; dyn[o + 3] = crowd.arms[i] + 2 * clapping; crowd.shout[i] *= 0.93;
+      dyn[o + 4] = clamp((L.perfX - p.x) / (Math.abs(p.z - PERF_Z) + 4) * 1.5, -1, 1) * 0.49 + 0.5 + Math.floor(crowd.shout[i] * 7.99);   // gaze in the fraction, an open mouth in the integer part
+      const lv = crowd.leave[i]; dyn[o + 5] = lv;
+      // the way out: along the row to the aisle, then up it; from the boxes and galleries, back through the door
+      if (lv > 0) {
+        if (p.tier === 0) { const ax = Math.sign(p.x || 1) * 4.0, u = smooth(0, 0.35, lv), w = Math.max(0, lv - 0.35) / 0.65; dyn[o + 6] = (ax - p.x) * u; dyn[o + 7] = w * (24 - p.z); }
+        else { const u = Math.min(1, lv * 1.6); dyn[o + 6] = -p.fx * 2.4 * u; dyn[o + 7] = -p.fz * 2.4 * u; }
+      } else { dyn[o + 6] = 0; dyn[o + 7] = 0; }
+    }
+    { // the conductor: applauds you while the house does, throws both arms up when you come back for a call
+      const o = N * 8, c = dir.conductor || { clap: 0, arms: 0 }, per = 0.42, ph = (nowT % per) / per;
+      dyn[o] = c.clap ? Math.min(1, Math.sin(Math.PI * ph) * 1.25) : 0; dyn[o + 1] = c.clap ? Math.exp(-ph * per * 20) : 0; dyn[o + 2] = 1;
+      dyn[o + 3] = c.arms + 2 * (c.clap ? 1 : 0); dyn[o + 4] = clamp((L.perfX + 1.35) / 7 * 1.5, -1, 1) * 0.49 + 0.5; dyn[o + 5] = c.gone || 0; dyn[o + 6] = -(c.gone || 0) * 3; dyn[o + 7] = 0;
+    }
+    gl.bindBuffer(gl.ARRAY_BUFFER, dBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, dyn);
+
+    // ── scene pass
+    gl.bindFramebuffer(gl.FRAMEBUFFER, msaa ? msaa.fbo : scene.fbo); gl.viewport(0, 0, R.w, R.h);
+    gl.clearColor(0.004, 0.003, 0.003, 1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); gl.disable(gl.BLEND); gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
+    gl.disable(gl.CULL_FACE);
+    gl.useProgram(hallProg); gl.uniformMatrix4fv(hallProg.u.uVP, false, view.vp); setUniformsLight(hallProg, L); gl.uniform1f(hallProg.u.uWing, L.wing); gl.uniform1f(hallProg.u.uSpotX, L.spotX);
+    { // the stage manager's torch sweeps the boards by the footlights, toward the wing on the right of your view
+      const halfH = Math.atan(Math.tan(fz / 2) * aspect), edge = Math.min(7, 3.4 * Math.tan(halfH));
+      const u = (L.time * 0.55) % 1, x = L.perfX - edge * (0.35 + 0.6 * u), zz = -0.12 + 0.05 * Math.sin(L.time * 3.1);
+      gl.uniform1f(hallProg.u.uTorch, (dir.torch || 0) * Math.sin(Math.PI * u) * (0.85 + 0.15 * Math.sin(L.time * 23)));
+      gl.uniform3f(hallProg.u.uTorchP, x, zz, 0.15);
+      if (dir.torch > 0.01) { const q = M4.project(view.vp, x, STAGE_Y, zz); R.torchScreenX = (q[0] * .5 + .5) * innerWidth; } else R.torchScreenX = null; }
+    gl.bindVertexArray(hallVao); gl.drawElements(gl.TRIANGLES, hallCount, gl.UNSIGNED_INT, 0);
+    // seats spring up when nobody's in them: when you stand, when you've gone, and the empty ones all night
+    for (let k = 0; k < NS; k++) { const st = seatList[k], i = st.person; const want = i === undefined ? 1 : (crowd.leave[i] > 0.02 || crowd.standH[i] > 0.6 ? 1 : 0);
+      seatTip[k] += (want - seatTip[k]) * (want > seatTip[k] ? 0.35 : 0.2); }
+    gl.bindBuffer(gl.ARRAY_BUFFER, stBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, seatTip);
+    gl.useProgram(seatProg); gl.uniformMatrix4fv(seatProg.u.uVP, false, view.vp); setUniformsLight(seatProg, L); gl.uniform1f(seatProg.u.uWing, L.wing); gl.uniform1f(seatProg.u.uSpotX, L.spotX);
+    gl.bindVertexArray(seatVao); gl.drawElementsInstanced(gl.TRIANGLES, seatIdx, gl.UNSIGNED_SHORT, 0, NS);
+    // audience (alpha-tested with soft edges; depth-sorted by the seat order is not needed at this size)
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(crowdProg); gl.uniformMatrix4fv(crowdProg.u.uVP, false, view.vp); setUniformsLight(crowdProg, L); gl.uniform3fv(crowdProg.u.uRight, view.right); gl.uniform1f(crowdProg.u.uNight, L.night || 0);
+    gl.bindVertexArray(crowdVao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, NI);
+    gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+    gl.useProgram(glintProg); gl.uniformMatrix4fv(glintProg.u.uVP, false, view.vp); setUniformsLight(glintProg, L); gl.uniform2f(glintProg.u.uRes, R.w, R.h);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, NI);
+    gl.depthMask(true); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    // flowers
+    const fl = dir.flowers; let nf = 0;
+    for (let k = Math.max(0, fl.length - FLW); k < fl.length; k++) { const f = fl[k]; if (dir.t < f.t0) continue; const u = clamp((dir.t - f.t0) / f.dur, 0, 1);
+      const x = lerp(f.x0, f.x1, u), z = lerp(f.z0, f.z1, u), y = lerp(f.y0, STAGE_Y + 0.03, u) + Math.sin(Math.PI * u) * 3.2;
+      const o = nf * 8; fd[o] = x; fd[o + 1] = y; fd[o + 2] = z; fd[o + 3] = f.rot0 + f.spin * Math.min(u, 1) * f.dur; fd[o + 4] = f.hue; fd[o + 5] = u >= 1 ? 1 : 0; nf++; }
+    if (nf) { gl.disable(gl.BLEND); gl.useProgram(flowerProg); gl.uniformMatrix4fv(flowerProg.u.uVP, false, view.vp); setUniformsLight(flowerProg, L); gl.uniform3fv(flowerProg.u.uRight, view.right); gl.uniform3fv(flowerProg.u.uUp, view.up);
+      gl.bindBuffer(gl.ARRAY_BUFFER, flowerBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, fd, 0, nf * 8); gl.bindVertexArray(flowerVao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, nf); }
+    // lamps (additive, depth-tested, no depth write)
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); gl.depthMask(false);
+    gl.useProgram(lampProg); gl.uniformMatrix4fv(lampProg.u.uVP, false, view.vp); gl.uniform3fv(lampProg.u.uRight, view.right); gl.uniform3fv(lampProg.u.uUp, view.up);
+    gl.uniform1f(lampProg.u.uStage, L.stage); gl.uniform1f(lampProg.u.uHouse, L.house); gl.uniform1f(lampProg.u.uChand, L.chand); gl.uniform1f(lampProg.u.uSpot, L.spot); gl.uniform1f(lampProg.u.uTime, L.time);
+    gl.uniform1f(lampProg.u.uBoothPx, L.inBeam * 3.0);
+    gl.bindVertexArray(lampVao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, lampData.length / 8);
+    // dust in the beam near you
+    if (L.spot > 0.01) {
+      const t = L.time;
+      for (let k = 0; k < DUST; k++) { const d = dust[k]; const x = L.spotX + d.o[0] + Math.sin(t * d.sp + d.ph) * 0.3, y = STAGE_Y + 0.2 + ((d.o[1] + t * d.sp * 0.08) % 3.2), z = PERF_Z + d.o[2] + Math.cos(t * d.sp * 0.7 + d.ph) * 0.3;
+        const tw = 0.5 + 0.5 * Math.sin(t * (1 + d.sp * 4) + d.ph * 3); const o = k * 8; dd[o] = x; dd[o + 1] = y; dd[o + 2] = z; dd[o + 3] = 0.004 + 0.003 * tw; dd[o + 4] = 1; dd[o + 5] = 0.9; dd[o + 6] = 0.75; dd[o + 7] = 7; }
+      gl.bindBuffer(gl.ARRAY_BUFFER, dustBuf); gl.bufferSubData(gl.ARRAY_BUFFER, 0, dd);
+      gl.uniform1f(lampProg.u.uStage, L.spot * 0.12); gl.bindVertexArray(dustVao); gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, DUST);
+    }
+    gl.depthMask(true);
+    if (msaa) { // resolve the multisampled scene (colour and depth) into the texture target
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, msaa.fbo); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, scene.fbo);
+      gl.blitFramebuffer(0, 0, R.w, R.h, 0, 0, R.w, R.h, gl.COLOR_BUFFER_BIT, gl.NEAREST);
+      gl.blitFramebuffer(0, 0, R.w, R.h, 0, 0, R.w, R.h, gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+      gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null); gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+    }
+    // beam (additive, reads depth)
+    gl.disable(gl.DEPTH_TEST);
+    gl.useProgram(beamProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scene.depth); gl.uniform1i(beamProg.u.uDepth, 0);
+    gl.uniformMatrix4fv(beamProg.u.uInvVP, false, view.inv); gl.uniform3fv(beamProg.u.uCam, view.eye); gl.uniform3fv(beamProg.u.uBooth, HOUSE.booth);
+    gl.uniform3f(beamProg.u.uTarget, L.spotX, STAGE_Y + 0.9, PERF_Z); gl.uniform1f(beamProg.u.uSpot, L.spot); gl.uniform1f(beamProg.u.uTime, L.time); gl.uniform1f(beamProg.u.uHaze, 1);
+    // (the depth texture is attached to the framebuffer we're drawing into, so draw the beam into the first bloom level's input instead)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    // ── post
+    gl.disable(gl.BLEND);
+    let src = scene;
+    for (let k = 0; k < blooms.length; k++) {
+      const b = blooms[k]; gl.bindFramebuffer(gl.FRAMEBUFFER, b.fbo); gl.viewport(0, 0, b.w, b.h);
+      gl.useProgram(downProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src.tex); gl.uniform1i(downProg.u.uTex, 0);
+      gl.uniform2f(downProg.u.uTexel, 1 / src.w, 1 / src.h); gl.uniform1f(downProg.u.uFirst, k === 0 ? 1 : 0); gl.uniform1f(downProg.u.uLdr, K.floatRT ? 0 : 1); K.fullscreen(); src = b;
+    }
+    gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+    for (let k = blooms.length - 2; k >= 0; k--) {
+      const b = blooms[k], s = blooms[k + 1]; gl.bindFramebuffer(gl.FRAMEBUFFER, b.fbo); gl.viewport(0, 0, b.w, b.h);
+      gl.useProgram(upProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, s.tex); gl.uniform1i(upProg.u.uTex, 0); gl.uniform2f(upProg.u.uTexel, 1 / s.w, 1 / s.h); K.fullscreen();
+    }
+    // beam goes into the bloom chain's top level at half resolution (cheap, and it wants to be soft anyway)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, blooms[0].fbo); gl.viewport(0, 0, blooms[0].w, blooms[0].h);
+    gl.useProgram(beamProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scene.depth); K.fullscreen();
+    gl.disable(gl.BLEND);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, R.w, R.h);
+    gl.useProgram(finalProg); gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, scene.tex); gl.uniform1i(finalProg.u.uTex, 0);
+    gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, blooms[0].tex); gl.uniform1i(finalProg.u.uBloom, 1);
+    gl.uniform1f(finalProg.u.uExposure, L.exposure); gl.uniform1f(finalProg.u.uFade, L.fade); gl.uniform1f(finalProg.u.uTime, L.time); gl.uniform1f(finalProg.u.uGrain, 0.035);
+    gl.uniform2f(finalProg.u.uRes, R.w, R.h);
+    K.fullscreen();
+    gl.activeTexture(gl.TEXTURE0);
+  }
+
+  // where on screen is a point in the house (for picking and for the gaze)
+  function toScreen(x, y, z) { const q = M4.project(view.vp, x, y, z); return [(q[0] * .5 + .5) * innerWidth, (1 - (q[1] * .5 + .5)) * innerHeight, q[2]]; }
+  return Object.assign(R, { frame, resize, view, toScreen });
+}
+
+// ───────── main.js ─────────
+// main.js — one clock, one loop. The crowd is simulated a moment ahead of what you see so its sound can be placed on
+// the audio thread to the sample; the picture reads the crowd's clap times from the past.
+
+const Q = new URLSearchParams(location.search);
+const DEBUG = Q.has('debug');
+const LOOKAHEAD = 0.1;
+const SPEED = +(Q.get('speed') || 1);   // testing only
+const CALM = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+const canvas = document.getElementById('c');
+const $said = document.getElementById('said'), $tally = document.getElementById('tally'), $title = document.getElementById('title'), $hint = document.getElementById('hint'), $end = document.getElementById('end'), $again = document.getElementById('again');
+const house = buildHouse(1);
+let nightSeed = +(Q.get('seed') || ((Date.now() / 1000) | 0) % 100000);
+let night, crowd, dir, now = 0;
+const cam = { eye: [0, 0, 0], yaw: 0, pitch: 0, roll: 0, zoom: 1 };
+const L = { stage: 0, spot: 0, house: 0, chand: 0, time: 0, bow: 0, perfX: 0, spotX: 0, wing: 0, exposure: 1, fade: 1, inBeam: 1, lift: 0, seek: 0 };
+function begin(seed, skipPreshow) {
+  night = newNight(seed); crowd = createCrowd(house, night, now); dir = createDirector(night, crowd); L.night = (seed % 997) / 997;
+  if (skipPreshow) { night.again = true; dir.title = 0; dir.start(true); }
+  cam.zoom = 1; L.lift = 0; L.seek = 0;
+}
+begin(nightSeed, false);
+
+const audio = createAudio(house);
+let R = null, glFailed = false;
+function makeRenderer() { try { R = createRenderer(canvas, house); } catch (e) { console.error(e); R = null; } if (!R) glFailed = true; }
+makeRenderer();
+if (!R) $title.innerHTML = '<p id="fail">This needs WebGL 2, which this browser doesn’t offer.<br>Try a recent Chrome, Safari, Firefox or Edge.</p>';
+// phones drop GPU contexts: stop drawing, and rebuild when it comes back
+canvas.addEventListener('webglcontextlost', e => { e.preventDefault(); R = null; });
+canvas.addEventListener('webglcontextrestored', () => { makeRenderer(); });
+
+// ── input ───────────────────────────────────────────────
+// A press becomes a bow unless it turns out to be a drag (a walk) within a moment; a quick tap is still a whole bow.
+let down = null, keysWalk = 0, dragging = false, pressTimer = 0, pressed = false;
+function unlock() { audio.start(); }
+function doPress() { if (!pressed) { pressed = true; dir.press(); } }
+canvas.addEventListener('pointerdown', e => {
+  if (down) return;                                   // one performer, one body: ignore a second finger
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  unlock();
+  down = { x: e.clientX, y: e.clientY, id: e.pointerId, lastX: e.clientX };
+  dragging = false; pressed = false;
+  if (dir.phase === 'preshow' || dir.phase === 'end') { doPress(); return; }
+  clearTimeout(pressTimer); if (!(dir.torch > 0.3 && R && R.torchScreenX != null && e.clientX > R.torchScreenX - innerWidth * 0.12)) pressTimer = setTimeout(() => { if (down && !dragging) doPress(); }, 130);
+});
+canvas.addEventListener('pointermove', e => {
+  if (e.pointerType === 'mouse' && !down) dir.look(-(e.clientX / innerWidth - 0.5) * 2, (e.clientY / innerHeight - 0.5) * 2);   // screen-right is world −x
+  if (!down || e.pointerId !== down.id) return;
+  const dx = e.clientX - down.x;
+  if (!dragging && Math.abs(dx) > 14) { dragging = true; clearTimeout(pressTimer); if (pressed) dir.release(); }
+  if (dragging) { dir.walkBy(-(e.clientX - down.lastX) / Math.max(320, innerWidth) * 12); down.lastX = e.clientX; }
+});
+const up = e => {
+  if (!down || e.pointerId !== down.id) return;
+  unlock();                                           // on touch screens, only the lift of the finger may start audio
+  clearTimeout(pressTimer);
+  if (!dragging && !pressed && e.type === 'pointerup') {
+    if (dir.torch > 0.3 && R && R.torchScreenX != null && e.clientX > R.torchScreenX - innerWidth * 0.12) dir.walkTo(-9.4);   // follow the torch toward the wing
+    else doPress();
+  }
+  down = null; dir.release();
+};
+canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+const isLeft = k => k === 'ArrowLeft' || k === 'a' || k === 'A', isRight = k => k === 'ArrowRight' || k === 'd' || k === 'D';
+addEventListener('keydown', e => {
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.target === $again) return;
+  if (e.repeat) { if (isLeft(e.key) || isRight(e.key) || e.key === ' ') e.preventDefault(); return; }
+  if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); unlock(); if (dir.phase === 'end') return; dir.press(); }
+  else if (isLeft(e.key) || isRight(e.key)) { e.preventDefault(); unlock(); const s = isLeft(e.key) ? 1 : -1; keysWalk = s; if (dir.phase === 'preshow') dir.press(); else dir.walkBy(1.6 * s); }
+});
+addEventListener('keyup', e => {
+  if (e.key === ' ' || e.key === 'Enter') dir.release();
+  if (isLeft(e.key) && keysWalk < 0) keysWalk = 0;
+  if (isRight(e.key) && keysWalk > 0) keysWalk = 0;
+});
+function letGo() { keysWalk = 0; if (down) { down = null; clearTimeout(pressTimer); } dir.release(); }
+addEventListener('blur', letGo);
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) letGo();
+  if (!audio.ctx) return;
+  if (document.hidden) audio.ctx.suspend().catch(() => {}); else audio.ctx.resume().catch(() => {});
+});
+$again.addEventListener('click', e => { e.stopPropagation(); if (dir.endText < 0.9) return; unlock(); restart(); });
+function restart() {
+  nightSeed = (nightSeed * 7919 + 17) % 100000; begin(nightSeed, true);
+  $end.style.transition = 'none'; $end.style.opacity = 0; $end.style.visibility = 'hidden';
+  requestAnimationFrame(() => { $end.style.transition = ''; });
+  canvas.focus({ preventScroll: true });
+}
+
+// ── the loop ────────────────────────────────────────────
+let t0 = performance.now() / 1000, last = 0, frames = 0, fpsT = 0, fps = 0;
+const $dbg = DEBUG ? Object.assign(document.body.appendChild(document.createElement('div')), { id: 'dbg' }) : null;
+const listener = { x: 0, yaw: 0 };
+
+function loop() {
+  requestAnimationFrame(loop);
+  now = performance.now() / 1000 - t0;
+  let dt = now - last;
+  if (dt > 0.25) { t0 += dt - 1 / 60; now = last + 1 / 60; dt = 1 / 60; } // after a hidden tab: carry on, don't catch up
+  last = now;
+  if (SPEED !== 1) { dt *= SPEED; now = (window.__simT = (window.__simT || 0) + dt); }
+  if (keysWalk) dir.walkBy(keysWalk * 2.2 * dt);
+  // the night
+  dir.update(dt);
+  while (crowd.S.t < now + LOOKAHEAD) crowd.step(crowd.DT);
+  // one-off sounds the director asks for
+  for (const c of dir.cues) {
+    if (c.type === 'clunk') audio.fx('clunk', 0.55, 0);
+    else if (c.type === 'cough') { const i = (Math.random() * crowd.N) | 0; crowd.S.events.push({ t: now + 0.2, type: 'cough', i, g: 1 }); }
+    else if (c.type === 'step') { audio.fx('step', 0.2, 0, true); if (Math.random() < 0.18) audio.fx('creak', 0.05, 0, true); }
+    else if (c.type === 'flower') audio.fx('flower', 0.28, clamp(-(c.x - dir.x) * 0.3, -1, 1), true);
+    else if (c.type === 'rustle') audio.fx('rustle', 0.035, Math.random() * 2 - 1);
+    else if (c.type === 'restart') restart();
+    else if (c.type === 'boo') { let i = -1; for (let k = 0; k < 300 && i < 0; k++) { const j = (Math.random() * crowd.N) | 0; if (house.people[j].tier === 4) i = j; } if (i >= 0) crowd.S.events.push({ t: now + 0.4, type: 'boo', i, g: 1 }); }
+    else if (c.type === 'heart') audio.fx('heart', 0.1, 0, true);
+    else if (c.type === 'cheerOne') { const i = crowd.S.lastIdx; if (i >= 0) crowd.S.events.push({ t: now + 0.3, type: 'whistle', i, g: 1.4 }); }
+  }
+  dir.cues.length = 0;
+  // the house's voice: short wordless shouts from random seats, more of them the louder the room feels
+  { const cheer = Math.max(dir.cheer, dir.phase === 'ovation' ? 0.18 * smooth(0.85, 1.2, crowd.S.G) : 0);
+    let n = cheer * 45 * dt;
+    if (Math.random() < cheer * 3 * dt) { const i = (Math.random() * 90) | 0; if (house.people[i] && house.people[i].tier === 0 && !crowd.leave[i]) crowd.shout[i] = 1; }
+    while (n > 0) { if (Math.random() < n) { const i = (Math.random() * crowd.N) | 0; if (!crowd.leave[i]) { crowd.S.events.push({ t: now + 0.05 + Math.random() * 0.05, type: 'shout', i, g: 0.6 + 0.6 * Math.random() }); crowd.shout[i] = 1; } } n -= 1; } }
+  // the pit: a dozen string players tapping their bows on their stands while the house is warm
+  if (dir.phase === 'ovation' && crowd.S.G > 0.5 && !dir.offstage) {
+    for (let k = 0; k < 2; k++) if (Math.random() < dt * 14 * Math.min(1, crowd.S.G)) audio.fx('bowtap', 0.07 + 0.05 * Math.random(), (Math.random() * 2 - 1) * 0.6 + dir.x * 0.05);
+  }
+  // camera: you are the performer
+  const wingT = smooth(WING_X - 0.6, WING_X + 1.6, Math.abs(dir.x));
+  const moving = Math.abs(dir.vx) > 0.15;
+  const bob = moving && !CALM ? Math.abs(Math.sin(dir.stepPhase * Math.PI)) * 0.035 : 0;
+  const bowE = dir.bow * dir.bow * (3 - 2 * dir.bow);
+  cam.eye[0] = dir.x; cam.eye[1] = STAGE_Y + EYE - bowE * 0.34 + bob + (CALM ? 0 : Math.sin(now * 1.6) * 0.004); cam.eye[2] = PERF_Z + bowE * 0.32 - wingT * 0.3;
+  cam.yaw = dir.lookYaw + dir.walkYaw + L.seek * 0.8 - 0.3 * Math.sin(Math.PI * clamp((1.4 - (dir.glanceT || 0)) / 1.4, 0, 1)) * (dir.glanceT > 0 ? 1 : 0) - Math.sign(dir.x) * wingT * 1.36 + (CALM ? 0 : Math.sin(now * 0.43) * 0.004);
+  L.lift = approach(L.lift, dir.phase === 'leaving' ? smooth(0, 6, dir.phaseT) * 0.1 : 0, 0.6, dt);
+  // in the empty house your eyes find the one who stayed
+  let seek = 0;
+  if ((dir.phase === 'last' || dir.phase === 'closing') && crowd.S.lastIdx >= 0) { const i = crowd.S.lastIdx, p = house.people[i], w = crowd.walkOffset(i); seek = Math.atan2(p.x + w[0] - dir.x, p.z + w[1] - PERF_Z); }
+  L.seek = approach(L.seek, seek, 0.7, dt);
+  cam.zoom = approach(cam.zoom, seek ? 0.66 : 1, seek ? 0.2 : 1, dt);
+  cam.pitch = -0.035 + dir.lookPitch - bowE * 1.02 - wingT * 0.06 + L.lift * cam.zoom - (1 - cam.zoom) * 0.22;
+  cam.roll = moving && !CALM ? Math.sin(dir.stepPhase * Math.PI) * 0.004 : 0;
+  // light
+  L.stage = dir.stage; L.spot = dir.spot; L.house = dir.house; L.chand = Math.max(0.05 * dir.stage, dir.chand); L.time = now; L.bow = bowE;
+  L.perfX = dir.x; L.spotX = dir.spotX; L.wing = wingT; L.fade = dir.fade; L.inBeam = clamp(1 - Math.abs(dir.x - dir.spotX) / 1.2, 0, 1);
+  L.exposure = 1.0 * (1 - 0.3 * dir.house);
+  // sound
+  listener.x = dir.x; listener.yaw = cam.yaw; listener.surge = crowd.S.surge || 0;
+  audio.schedule(crowd.S.events, now, listener);
+  audio.update(dt, listener, crowd.S, dir);
+  // picture
+  if (R && !(dir.phase === 'end' && dir.fade > 0.998)) R.frame(cam, L, crowd, dir, now);
+  else if (R) { R.gl.bindFramebuffer(R.gl.FRAMEBUFFER, null); R.gl.clearColor(0, 0, 0, 1); R.gl.clear(R.gl.COLOR_BUFFER_BIT); }
+  // words
+  if (!glFailed) $title.style.opacity = dir.title.toFixed(3);
+  const needSound = !audio.running() && !audio.failed;
+  $hint.style.opacity = (dir.phase === 'preshow' || (dir.phase === 'breath' && dir.phaseT > 1.5) ? 0.9 : (needSound && dir.phase !== 'end' ? (dir.t < 14 ? 0.8 : dir.t < 25 ? 0.45 : 0) * (1 - dir.fade) : 0)).toFixed(3);
+  if (dir.phase !== 'preshow') $hint.lastChild.textContent = dir.phase === 'breath' ? (audio.running() || audio.failed ? 'they are waiting' : 'they are waiting \u00b7 sound on') : 'tap for sound';
+  if (dir.phase === 'end' && !dir.tallied) {
+    dir.tallied = true; const a = Math.round(dir.applauseT), parts = [`${Math.floor(a / 60)}′ ${String(a % 60).padStart(2, '0')}″ of applause`];
+    if (dir.returns) parts.push(`${dir.returns} curtain call${dir.returns > 1 ? 's' : ''}`);
+    if (dir.roses) parts.push(`${dir.roses} rose${dir.roses > 1 ? 's' : ''}`);
+    const said = dir.spoiled ? 'You asked for one bow too many.' : dir.returns >= 2 ? `They called you back ${['', 'once', 'twice', 'three times', 'four times'][dir.returns] || dir.returns + ' times'}.` : dir.returns === 1 ? 'They called you back.' : dir.maxStand > 0.6 ? 'They stood for you.' : 'They were kind.';
+    $said.textContent = said;
+    $tally.innerHTML = parts.map(x => `<span>${x}</span>`).join('<i> \u00b7 </i>');
+  }
+  // the end card only exists when it is showing: nothing invisible can be tapped
+  const endOn = dir.endText > 0.02;
+  $end.style.opacity = dir.endText.toFixed(3); $end.style.visibility = endOn ? 'visible' : 'hidden'; $end.style.pointerEvents = dir.endText > 0.5 ? 'auto' : 'none';
+  frames++; fpsT += dt; if (fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
+  if ($dbg) { const S = crowd.S; $dbg.textContent = `${dir.phase} ${dir.phaseT.toFixed(1)}s  fps ${fps.toFixed(0)}  N ${crowd.N}\nG ${S.G.toFixed(2)} D ${S.D.toFixed(2)} clap ${(S.frac * 100).toFixed(0)}% R ${S.R.toFixed(2)} mII ${S.meanM.toFixed(2)} stand ${(S.standFrac * 100).toFixed(0)}% left ${(S.leaving * 100).toFixed(0)}%\nfresh ${dir.fresh.toFixed(2)} budget ${dir.budget.toFixed(2)} x ${dir.x.toFixed(1)} bow ${dir.bow.toFixed(2)} audio ${audio.running()}${audio.engine ? ' ' + audio.engine.kind : ''}`; }
+}
+requestAnimationFrame(loop);
+
+// hooks for the test harness
+window.__ov = { get dir() { return dir; }, get crowd() { return crowd; }, audio, house, get fps() { return fps; },
+  bow(ms) { dir.press(); setTimeout(() => dir.release(), ms || 400); }, walk(x) { dir.walkTo(x); }, restart };
+
+})();
+</script>
+</body>
+</html>

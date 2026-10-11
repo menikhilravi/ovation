@@ -1,0 +1,698 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<title>Foundry</title>
+<style>
+html,body{margin:0;height:100%;background:#060403;overflow:hidden;overscroll-behavior:none}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none;outline:none}
+#dbg{position:fixed;left:8px;bottom:6px;font:11px/1.35 ui-monospace,Menlo,monospace;color:#c9a47c;white-space:pre;pointer-events:none;display:none;text-shadow:0 1px 2px #000}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="dbg"></div>
+<script>
+'use strict';
+// =====================================================================================
+// FOUNDRY (prototype) — a bronze bell you reshape with your hands while it is still ringing.
+// Profile (24 nodes, crown->lip) -> per circumferential order n=2..7 a 1-D shell/ring Rayleigh-Ritz
+// eigenproblem (ring bending + meridional bending + twist, mass with inextensional tangential term)
+// -> 3 meridional orders each -> calibrated so the default shape gives the church-bell series
+// -> AudioWorklet modal synth (split degenerate pairs = warble), frequencies glide phase-continuously.
+// =====================================================================================
+(() => {
+const Q = location.search;
+const DEBUG = /[?&]debug\b/.test(Q);
+const dbgEl = document.getElementById('dbg'); if (DEBUG) dbgEl.style.display = 'block';
+
+// ---------------------------------------------------------------- profile
+const NP = 24;
+const R = new Float64Array(NP), Z = new Float64Array(NP), HT = new Float64Array(NP), SS = new Float64Array(NP);
+const HANG = 1.30, CAPH = 0.12;
+const DEF = [[0.50,1.30],[0.522,1.16],[0.54,1.00],[0.563,0.82],[0.60,0.63],[0.665,0.44],[0.765,0.26],[0.89,0.10],[0.965,0.03],[1.0,0.0]];
+function crSpline(P, per) {
+  const out = [];
+  for (let i = 0; i < P.length - 1; i++) {
+    const p0 = P[Math.max(0, i - 1)], p1 = P[i], p2 = P[i + 1], p3 = P[Math.min(P.length - 1, i + 2)];
+    for (let k = 0; k < per; k++) {
+      const t = k / per, t2 = t * t, t3 = t2 * t, v = [0, 0];
+      for (let d = 0; d < 2; d++) v[d] = 0.5 * (2 * p1[d] + (-p0[d] + p2[d]) * t + (2 * p0[d] - 5 * p1[d] + 4 * p2[d] - p3[d]) * t2 + (-p0[d] + 3 * p1[d] - 3 * p2[d] + p3[d]) * t3);
+      out.push(v);
+    }
+  }
+  out.push(P[P.length - 1].slice());
+  return out;
+}
+function resample(D, N, oR, oZ) {
+  const cum = [0];
+  for (let i = 1; i < D.length; i++) cum.push(cum[i - 1] + Math.hypot(D[i][0] - D[i - 1][0], D[i][1] - D[i - 1][1]));
+  const L = cum[cum.length - 1]; let s = 0;
+  for (let j = 0; j < N; j++) {
+    const tgt = L * j / (N - 1);
+    while (s < D.length - 2 && cum[s + 1] < tgt) s++;
+    const u = (tgt - cum[s]) / Math.max(1e-9, cum[s + 1] - cum[s]);
+    oR[j] = D[s][0] + (D[s + 1][0] - D[s][0]) * u; oZ[j] = D[s][1] + (D[s + 1][1] - D[s][1]) * u;
+  }
+}
+function setDefaultShape(oR = R, oZ = Z) { resample(crSpline(DEF, 16), NP, oR, oZ); }
+for (let j = 0; j < NP; j++) { SS[j] = j / (NP - 1); HT[j] = 0.045 + 0.085 * Math.exp(-(((SS[j] - 0.87) / 0.10) ** 2)); }
+setDefaultShape();
+const DEF_R = R.slice(), DEF_Z = Z.slice();
+
+// ---------------------------------------------------------------- modal model
+const MODES = []; for (let n = 2; n <= 7; n++) for (let m = 0; m < 3; m++) MODES.push({ n, m });
+const NM = MODES.length, NX = 16, NOSC = NM * 2 + NX;
+const NAMES = { '2,0': 'hum', '2,1': 'prime', '3,0': 'tierce', '3,1': 'quint', '4,0': 'nominal' };
+const TGT = { '2,0': .5, '2,1': 1, '3,0': 1.2, '3,1': 1.5, '4,0': 2, '4,1': 2.66, '5,0': 2.52, '5,1': 3.36, '6,0': 4.0, '6,1': 4.8, '7,0': 5.33, '7,1': 6.35 };
+const GAIN = [ .36, .52, .10,  .62, .30, .09,  .85, .28, .08,  .45, .18, .06,  .32, .12, .05,  .22, .08, .04 ];
+const XR = [1.19, 1.41, 1.67, 1.98, 2.33, 2.75, 3.1, 3.55, 4.05, 4.6, 5.2, 5.9, 6.7, 7.6, 8.5, 9.6], XG = XR.map((_, i) => 0.1 * Math.pow(0.84, i));
+const F_PRIME = 196;
+const raw = new Float64Array(NM), freq = new Float64Array(NM), cal = new Float64Array(NM);
+const shapes = MODES.map(() => new Float64Array(NP));
+// fixed per-mode asymmetry: pair split (fraction of f) and orientation of the split pair
+let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+const SPLIT = MODES.map((_, k) => 0.22 + 0.9 * rnd() + 0.12 * MODES[k].n), ALPHA = MODES.map(() => rnd() * Math.PI);
+const KM = new Float64Array(NP * NP), AM = new Float64Array(NP * NP), VM = new Float64Array(NP * NP), MD = new Float64Array(NP), SEG = new Float64Array(NP - 1), DSN = new Float64Array(NP);
+
+function jacobi(A, V, n) {
+  V.fill(0); for (let i = 0; i < n; i++) V[i * n + i] = 1;
+  for (let sweep = 0; sweep < 60; sweep++) {
+    let off = 0, dia = 0;
+    for (let p = 0; p < n; p++) { dia += A[p * n + p] ** 2; for (let q = p + 1; q < n; q++) off += A[p * n + q] ** 2; }
+    if (off < 1e-24 * dia) break;
+    for (let p = 0; p < n - 1; p++) for (let q = p + 1; q < n; q++) {
+      const apq = A[p * n + q]; if (Math.abs(apq) < 1e-300) continue;
+      const app = A[p * n + p], aqq = A[q * n + q];
+      const th = (aqq - app) / (2 * apq);
+      const t = (th >= 0 ? 1 : -1) / (Math.abs(th) + Math.sqrt(th * th + 1));
+      const c = 1 / Math.sqrt(t * t + 1), s = t * c;
+      for (let k = 0; k < n; k++) { const akp = A[k * n + p], akq = A[k * n + q]; A[k * n + p] = c * akp - s * akq; A[k * n + q] = s * akp + c * akq; }
+      for (let k = 0; k < n; k++) { const apk = A[p * n + k], aqk = A[q * n + k]; A[p * n + k] = c * apk - s * aqk; A[q * n + k] = s * apk + c * aqk; }
+      for (let k = 0; k < n; k++) { const vkp = V[k * n + p], vkq = V[k * n + q]; V[k * n + p] = c * vkp - s * vkq; V[k * n + q] = s * vkp + c * vkq; }
+    }
+  }
+}
+function solveModes() {
+  for (let j = 0; j < NP - 1; j++) SEG[j] = Math.max(1e-4, Math.hypot(R[j + 1] - R[j], Z[j + 1] - Z[j]));
+  for (let j = 0; j < NP; j++) DSN[j] = 0.5 * ((j > 0 ? SEG[j - 1] : 0) + (j < NP - 1 ? SEG[j] : 0));
+  const idx = new Array(NP);
+  for (let n = 2; n <= 7; n++) {
+    KM.fill(0);
+    const n2 = n * n, cc = (n2 - 1) ** 2, tw = 2 * (1 - 0.3) * n2;
+    for (let j = 0; j < NP; j++) {
+      const D = HT[j] ** 3 / 12, r = R[j];
+      KM[j * NP + j] += D * cc / (r * r * r * r) * r * DSN[j];
+      MD[j] = HT[j] * r * DSN[j] * (1 + 1 / n2);
+    }
+    for (let j = 1; j < NP - 1; j++) {  // meridional bending (curvature of w along the profile)
+      const a = SEG[j - 1], b = SEG[j], c = [2 / (a * (a + b)), -2 / (a * b), 2 / (b * (a + b))], ii = [j - 1, j, j + 1];
+      const wg = HT[j] ** 3 / 12 * R[j] * DSN[j];
+      for (let p = 0; p < 3; p++) for (let q = 0; q < 3; q++) KM[ii[p] * NP + ii[q]] += wg * c[p] * c[q];
+    }
+    for (let j = 0; j < NP - 1; j++) {  // twist (n^2 w'/r)^2
+      const L = SEG[j], rm = (R[j] + R[j + 1]) / 2, hm = (HT[j] + HT[j + 1]) / 2;
+      const wg = tw * hm ** 3 / 12 / (rm * rm) * rm / L;
+      KM[j * NP + j] += wg; KM[(j + 1) * NP + j + 1] += wg; KM[j * NP + j + 1] -= wg; KM[(j + 1) * NP + j] -= wg;
+    }
+    KM[0] *= 40;  // crown holds the shoulder nearly still
+    for (let p = 0; p < NP; p++) for (let q = 0; q < NP; q++) AM[p * NP + q] = KM[p * NP + q] / Math.sqrt(MD[p] * MD[q]);
+    jacobi(AM, VM, NP);
+    for (let i = 0; i < NP; i++) idx[i] = i;
+    idx.sort((a, b) => AM[a * NP + a] - AM[b * NP + b]);
+    for (let m = 0; m < 3; m++) {
+      const k = (n - 2) * 3 + m, col = idx[m], sh = shapes[k];
+      raw[k] = Math.sqrt(Math.max(1e-12, AM[col * NP + col]));
+      let mx = 0; for (let j = 0; j < NP; j++) { sh[j] = VM[j * NP + col] / Math.sqrt(MD[j]); if (Math.abs(sh[j]) > Math.abs(mx)) mx = sh[j]; }
+      const sg = (sh[NP - 1] < 0 ? -1 : 1) / Math.abs(mx || 1);
+      for (let j = 0; j < NP; j++) sh[j] *= sg;
+    }
+  }
+  for (let k = 0; k < NM; k++) freq[k] = cal[k] * raw[k];
+}
+// calibrate on the default bell so it speaks the church-bell series
+solveModes();
+for (let k = 0; k < NM; k++) { const { n, m } = MODES[k]; const t = TGT[n + ',' + m]; if (t) cal[k] = t * F_PRIME / raw[k]; }
+for (let k = 0; k < NM; k++) if (MODES[k].m === 2) cal[k] = Math.sqrt(cal[k - 1] * cal[k - 2]) * 1.0;
+for (let k = 0; k < NM; k++) freq[k] = cal[k] * raw[k];
+const DEF_FREQ = freq.slice();
+
+function t60(f) { return Math.max(0.4, Math.min(50, 50 * Math.pow(98 / f, 0.95))); }
+function oscFreqs(out = new Float64Array(NOSC)) {
+  for (let k = 0; k < NM; k++) { const f = freq[k], e = Math.min(SPLIT[k], 0.004 * f) * 0.5; out[2 * k] = f - e; out[2 * k + 1] = f + e; }
+  const top = freq[15]; for (let i = 0; i < NX; i++) out[2 * NM + i] = top * XR[i];
+  return out;
+}
+function interpShape(sh, s) { const x = Math.max(0, Math.min(NP - 1, s * (NP - 1))), i = Math.min(NP - 2, Math.floor(x)), u = x - i; return sh[i] * (1 - u) + sh[i + 1] * u; }
+function strikeAmps(sg, theta, v) {
+  const a = new Float64Array(NOSC);
+  const fc = (650 + 3200 * sg * sg) * (0.45 + v);
+  const amp = new Float64Array(NM);
+  for (let k = 0; k < NM; k++) {
+    const phi = interpShape(shapes[k], sg), f = freq[k];
+    const A = GAIN[k] * v * (0.12 + 0.88 * Math.abs(phi)) / Math.sqrt(1 + (f / fc) ** 2);
+    const ang = MODES[k].n * (theta - ALPHA[k]);
+    a[2 * k] = A * Math.cos(ang); a[2 * k + 1] = A * Math.sin(ang); amp[k] = A;
+  }
+  const top = freq[15];
+  for (let i = 0; i < NX; i++) { const f = top * XR[i]; a[2 * NM + i] = XG[i] * v * v * (0.3 + 0.7 * sg) / Math.sqrt(1 + (f / (fc * 1.6)) ** 2) * (i % 2 ? -1 : 1); }
+  return { a, amp, noise: 0.22 * v * v * (0.35 + 0.65 * sg) };
+}
+
+// ---------------------------------------------------------------- DSP core (shared: worklet + offline test render)
+const DSP_SRC = `
+class BellDSP {
+  constructor(sr, n) { this.sr = sr; this.n = n; this.re = new Float64Array(n); this.im = new Float64Array(n);
+    this.f = new Float64Array(n); this.tf = new Float64Array(n); this.pan = new Float64Array(n).fill(0.5);
+    this.gl = 1 - Math.exp(-128 / (0.03 * sr)); this.nz = 0; this.nd = Math.exp(-1 / (0.0045 * sr)); this.h1 = 0; this.x1 = 0; this.s = 22222; }
+  setPan(p) { for (let i = 0; i < this.n; i++) this.pan[i] = p[i]; }
+  setFreqs(a) { for (let i = 0; i < this.n; i++) { this.tf[i] = a[i]; if (!this.f[i]) this.f[i] = a[i]; } }
+  strike(a, nz) { for (let i = 0; i < this.n; i++) this.re[i] += a[i]; this.nz += nz; }
+  t60(f) { return Math.max(0.4, Math.min(50, 50 * Math.pow(98 / f, 0.95))); }
+  render(L, Rt, len) {
+    const TAU = 2 * Math.PI, sr = this.sr;
+    for (let i = 0; i < this.n; i++) {
+      let re = this.re[i], im = this.im[i];
+      const f = (this.f[i] += (this.tf[i] - this.f[i]) * this.gl);
+      if (Math.abs(re) + Math.abs(im) < 1e-6 || f <= 0 || f > sr * 0.45) { this.re[i] = 0; this.im[i] = 0; continue; }
+      const g = Math.exp(-6.907755 / (this.t60(f) * sr)), w = TAU * f / sr, a = Math.cos(w) * g, b = Math.sin(w) * g;
+      const pl = 1 - this.pan[i], pr = this.pan[i];
+      for (let k = 0; k < len; k++) { const t = re * a - im * b; im = re * b + im * a; re = t; L[k] += im * pl; Rt[k] += im * pr; }
+      this.re[i] = re; this.im[i] = im;
+    }
+    if (this.nz > 1e-5) {
+      for (let k = 0; k < len; k++) {
+        this.s = (this.s * 16807) % 2147483647; const x = this.s / 1073741823.5 - 1;
+        const hp = x - this.x1 + 0.6 * this.h1; this.x1 = x; this.h1 = hp;   // bright, clangy tick
+        const y = hp * this.nz; this.nz *= this.nd; L[k] += y; Rt[k] += y;
+      }
+    } else this.nz = 0;
+  }
+}`;
+const BellDSP = new Function(DSP_SRC + '\nreturn BellDSP;')();
+const PAN = new Float64Array(NOSC); for (let k = 0; k < NM; k++) { PAN[2 * k] = 0.3; PAN[2 * k + 1] = 0.7; } for (let i = 0; i < NX; i++) PAN[2 * NM + i] = 0.5;
+
+// ---------------------------------------------------------------- audio graph
+let ac = null, node = null, audioReady = false, audioStarting = false; const pending = [];
+const MASTER = 0.16;
+function makeIR(ctx, sec) {
+  const sr = ctx.sampleRate, n = Math.floor(sec * sr), b = ctx.createBuffer(2, n, sr);
+  for (let c = 0; c < 2; c++) {
+    const d = b.getChannelData(c); let s = 1234 + c * 999, lp = 0;
+    for (let i = 0; i < n; i++) {
+      s = (s * 16807) % 2147483647; const x = s / 1073741823.5 - 1, t = i / sr;
+      const k = 0.55 - 0.45 * Math.min(1, t / sec); lp += (x - lp) * k;   // darkens as it decays
+      d[i] = lp * Math.exp(-6.9 * t / sec) * (t < 0.018 ? t / 0.018 : 1) * 0.6;
+    }
+  }
+  return b;
+}
+function startAudio() {
+  if (ac) { if (ac.state !== 'running') ac.resume(); return; }
+  if (audioStarting) return; audioStarting = true;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    ac = new AC({ latencyHint: 'interactive' });
+    ac.resume();
+    const src = DSP_SRC + `
+class BellProc extends AudioWorkletProcessor {
+  constructor(o) { super(); this.d = new BellDSP(sampleRate, o.processorOptions.n);
+    this.port.onmessage = e => { const m = e.data; if (m.t === 'f') this.d.setFreqs(m.f); else if (m.t === 's') this.d.strike(m.a, m.nz); else if (m.t === 'p') this.d.setPan(m.p); }; }
+  process(i, o) { const L = o[0][0], R = o[0][1] || o[0][0]; this.d.render(L, R, L.length); return true; }
+}
+registerProcessor('bell', BellProc);`;
+    const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    ac.audioWorklet.addModule(url).then(() => {
+      node = new AudioWorkletNode(ac, 'bell', { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2], processorOptions: { n: NOSC } });
+      const comp = ac.createDynamicsCompressor();
+      comp.threshold.value = -8; comp.knee.value = 6; comp.ratio.value = 10; comp.attack.value = 0.002; comp.release.value = 0.3;
+      const dry = ac.createGain(); dry.gain.value = MASTER;
+      const wet = ac.createGain(); wet.gain.value = MASTER * 0.55;
+      const conv = ac.createConvolver(); conv.buffer = makeIR(ac, 3.4);
+      node.connect(dry); node.connect(conv); conv.connect(wet); dry.connect(comp); wet.connect(comp); comp.connect(ac.destination);
+      node.port.postMessage({ t: 'p', p: Array.from(PAN) });
+      node.port.postMessage({ t: 'f', f: Array.from(oscFreqs()) });
+      audioReady = true;
+      for (const p of pending.splice(0)) node.port.postMessage(p);
+    }).catch(e => console.warn('audio init failed', e));
+  } catch (e) { console.warn('audio unavailable', e); }
+}
+function sendAudio(msg) { if (audioReady) node.port.postMessage(msg); else if (msg.t === 's') { pending.length = 0; pending.push(msg); } }
+let lastFreqSent = 0;
+function pushFreqs() { if (audioReady) node.port.postMessage({ t: 'f', f: Array.from(oscFreqs()) }); }
+
+// ---------------------------------------------------------------- state
+const env = new Float64Array(NM);           // visual envelope of each mode (tracks the audio decay)
+const envTheta = new Float64Array(NM);
+const heatN = new Float64Array(NP), heatT = new Float64Array(NP);
+let flash = null, strikes = 0, t0 = performance.now(), nowS = 0;
+let swayA = 0, swayV = 0;
+const grab = { on: false, id: -1, sg: 0, theta: 0, x0: 0, y0: 0, ax0: 0, cosT: 1, wpp: 0.004, bR: new Float64Array(NP), bZ: new Float64Array(NP), moved: false };
+let dirtyShape = true, shapeVersion = 0;
+
+function strike(sg, theta, v) {
+  const s = strikeAmps(sg, theta, v);
+  sendAudio({ t: 's', a: Array.from(s.a), nz: s.noise });
+  for (let k = 0; k < NM; k++) { env[k] = Math.hypot(env[k], s.amp[k]); envTheta[k] = theta; }
+  flash = { s: sg, theta, t: nowS, v };
+  swayV += Math.max(0.2, Math.sin(theta)) * v * 0.02;
+  strikes++;
+}
+
+function applyDrag(dr, dz) {
+  const sig = 0.21;
+  for (let j = 0; j < NP; j++) {
+    const w = Math.exp(-(((SS[j] - grab.sg) / sig) ** 2));
+    R[j] = grab.bR[j] + w * dr; Z[j] = grab.bZ[j] + w * dz;
+  }
+  constrain();
+}
+function constrain() {
+  for (let j = 0; j < NP; j++) R[j] = Math.max(0.14, Math.min(1.85, R[j]));
+  for (let j = 1; j < NP; j++) Z[j] = Math.min(Z[j], Z[j - 1] - 0.008);
+  // wall segments cannot get absurdly long (keeps the mesh / model sane)
+  const shift = HANG - Z[0]; for (let j = 0; j < NP; j++) Z[j] += shift;
+  const minZ = HANG - 2.35; if (Z[NP - 1] < minZ) { const k = (HANG - minZ) / (HANG - Z[NP - 1]); for (let j = 0; j < NP; j++) Z[j] = HANG - (HANG - Z[j]) * k; }
+  // gentle smoothing of radius kinks
+  const tmp = R.slice(); for (let j = 1; j < NP - 1; j++) R[j] = tmp[j] + 0.2 * (0.5 * (tmp[j - 1] + tmp[j + 1]) - tmp[j]);
+  dirtyShape = true;
+}
+
+// ---------------------------------------------------------------- WebGL
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl2', { antialias: true, alpha: false, powerPreference: 'high-performance' });
+if (!gl) { document.body.style.color = '#a88'; document.body.insertAdjacentHTML('beforeend', '<p style="position:fixed;top:45%;width:100%;text-align:center;font:15px Georgia,serif">This bell needs WebGL2.</p>'); return; }
+let W = 1, H = 1, DPR = 1, CW = 1, CH = 1;
+function resize() { DPR = Math.min(2, devicePixelRatio || 1); CW = innerWidth; CH = innerHeight; W = cv.width = Math.round(CW * DPR); H = cv.height = Math.round(CH * DPR); }
+addEventListener('resize', resize); resize();
+
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; }
+function prog(vs, fs) { const p = gl.createProgram(); gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p)); return p; }
+
+const BG = prog(`#version 300 es
+void main(){ vec2 p = vec2((gl_VertexID<<1)&2, gl_VertexID&2); gl_Position = vec4(p*2.-1., 0., 1.); }`,
+`#version 300 es
+precision highp float; uniform vec2 uRes; uniform vec2 uC; uniform float uT; out vec4 o;
+float h(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233)))*43758.5453); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / uRes; float asp = uRes.x/uRes.y;
+  vec2 d = (uv - uC) * vec2(asp, 1.);
+  float r = length(d);
+  vec3 c = mix(vec3(.004,.003,.0026), vec3(.052,.036,.025), exp(-r*r*2.4));
+  // faint shaft of dusty light from the upper left
+  vec2 ld = normalize(vec2(.62*asp, -.78)); vec2 q = (uv - vec2(uC.x - .55, 1.05)) * vec2(asp,1.);
+  float along = dot(q, ld), across = abs(q.x*ld.y - q.y*ld.x);
+  float beam = smoothstep(.0,.25,along) * exp(-across*across/(.02 + along*.05)) * exp(-along*.9);
+  c += vec3(.09,.062,.04) * beam * .55;
+  c += (h(gl_FragCoord.xy + uT) - .5) / 255.;
+  o = vec4(c, 1.);
+}`);
+const BELL = prog(`#version 300 es
+layout(location=0) in vec3 aP; layout(location=1) in vec3 aN; layout(location=2) in vec3 aA;
+uniform mat4 uVP, uM; out vec3 vW, vN, vA, vO;
+void main(){ vec4 w = uM * vec4(aP,1.); vW = w.xyz; vN = mat3(uM) * aN; vA = aA; vO = aP; gl_Position = uVP * w; }`,
+`#version 300 es
+precision highp float;
+in vec3 vW, vN, vA, vO; uniform vec3 uEye; uniform float uT; out vec4 o;
+float hash(vec3 p){ p = fract(p*.3183099 + .1); p *= 17.; return fract(p.x*p.y*p.z*(p.x+p.y+p.z)); }
+float noise(vec3 x){ vec3 i = floor(x), f = fract(x); f = f*f*(3.-2.*f);
+  return mix(mix(mix(hash(i),hash(i+vec3(1,0,0)),f.x),mix(hash(i+vec3(0,1,0)),hash(i+vec3(1,1,0)),f.x),f.y),
+             mix(mix(hash(i+vec3(0,0,1)),hash(i+vec3(1,0,1)),f.x),mix(hash(i+vec3(0,1,1)),hash(i+vec3(1,1,1)),f.x),f.y),f.z); }
+float fbm(vec3 p){ return .5*noise(p) + .25*noise(p*2.03) + .125*noise(p*4.1) + .0625*noise(p*8.3); }
+vec3 env(vec3 r, float ro){
+  float bl = .04 + ro * .55;
+  vec3 kd = normalize(vec3(-.70, .52, .50));
+  float a = acos(clamp(dot(r, kd), -1., 1.));
+  float soft = 1. - smoothstep(.30 - bl, .30 + bl, a);
+  float az = atan(r.z, r.x), azs = atan(-.55, .83);
+  float strip = (1. - smoothstep(.05, .05 + bl*1.4, abs(az - azs))) * smoothstep(-.35, .05, r.y) * (1. - smoothstep(.55, .85, r.y));
+  float flo = smoothstep(.05, -.5, r.y);
+  float top = smoothstep(.6, 1., r.y);
+  return vec3(1., .74, .48) * soft * 3.2 + vec3(.55, .66, .95) * strip * 1.1 + vec3(.20, .11, .05) * flo * .35 + vec3(.03,.024,.02) + vec3(.05,.04,.03)*top;
+}
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+.03))/(x*(2.43*x+.59)+.14), 0., 1.); }
+void main(){
+  vec3 N = normalize(vN), V = normalize(uEye - vW);
+  float side = vA.z;
+  if (side < .3) { // dark iron (axle, straps, clapper) or old timber (headstock)
+    if (dot(N,V) < 0.) N = -N;
+    vec3 R = reflect(-V, N); float nv = max(dot(N,V), 0.);
+    vec3 Lk = normalize(vec3(-.70, .52, .50)); float nl = max(dot(N, Lk), 0.);
+    vec3 c;
+    if (side < .15) c = env(R, .5) * vec3(.07,.07,.075) * (1. + 3.*pow(1.-nv, 4.)) + vec3(.012,.011,.01) * nl;
+    else { float gr = fbm(vec3(vO.x*1.5, vO.y*22., vO.z*22.)) * .6 + fbm(vO*9.)*.4;
+      vec3 alb = mix(vec3(.016,.010,.006), vec3(.05,.03,.017), gr);
+      c = alb * (nl * 1.1 + .1) + env(R, .7) * .01; }
+    if (vO.y < 1.3 && side < .15) c *= .35;   // clapper, inside the bell
+    c = aces(c); o = vec4(pow(c, vec3(1./2.2)) + (hash(vec3(gl_FragCoord.xy, uT)) - .5) / 255., 1.); return;
+  }
+  // cast-bronze micro relief
+  vec3 op = vO * 7.;
+  float n0 = fbm(op); vec3 gN = vec3(fbm(op+vec3(.05,0,0)) - n0, fbm(op+vec3(0,.05,0)) - n0, fbm(op+vec3(0,0,.05)) - n0);
+  N = normalize(N + gN * .45);
+  // decorative fillets (raised rings) along the meridian
+  float s = vA.y;
+  if (side > .9 && s > 0. && s < 1.) {
+    vec3 tth = normalize(vec3(-vO.z, 0., vO.x) + 1e-5); vec3 tm = normalize(cross(tth, N));
+    float db = 0.;
+    for (int i = 0; i < 5; i++) { float c = i==0?.05:i==1?.068:i==2?.79:i==3?.812:.83; float w = i==1||i==3?.004:.0055; float x = (s - c)/w; db += -2.*x/w*exp(-x*x); }
+    N = normalize(N + tm * db * .0028);
+  }
+  if (dot(N, V) < 0.) N = -N;
+  float nv = max(dot(N, V), 1e-3);
+  float ro = clamp(.20 + .16 * fbm(vO*5.3 + 3.), .12, .5);
+  float pat = smoothstep(.5, .78, fbm(vO*2.6 + 11.)) * .75;
+  vec3 F0 = mix(vec3(.80, .50, .27), vec3(.50, .32, .18), smoothstep(.3, .8, fbm(vO*1.3)));
+  vec3 F = F0 + (1. - F0) * pow(1. - nv, 5.);
+  vec3 R = reflect(-V, N);
+  vec3 spec = F * env(R, ro);
+  // crisp key highlight (GGX)
+  vec3 L = normalize(vec3(-.70, .52, .50)); vec3 Hh = normalize(L + V); float nl = max(dot(N, L), 0.), nh = max(dot(N, Hh), 0.);
+  float a2 = ro*ro*ro*ro; float dd = nh*nh*(a2 - 1.) + 1.; float Dg = a2 / (3.14159 * dd * dd);
+  float k = ro*ro*.5; float G = nl / (nl*(1.-k)+k) * nv / (nv*(1.-k)+k);
+  spec += F * Dg * G / (4. * nv + 1e-3) * vec3(1., .78, .55) * 1.4;
+  vec3 dif = vec3(.035, .042, .03) * (nl * .9 + .1);
+  vec3 c = mix(spec, dif + spec * .15, pat);
+  if (side < .75) c *= .10 + .16 * smoothstep(.7, 0., vO.y);     // inside the mouth: occluded
+  // heat of the worked metal
+  float e = vA.x;
+  c += vec3(1., .22, .04) * e * .55 + vec3(1., .55, .2) * e * e * e * .9;
+  c = aces(c * 1.05);
+  c = pow(c, vec3(1./2.2));
+  c += (hash(vec3(gl_FragCoord.xy, uT)) - .5) / 255.;
+  o = vec4(c, 1.);
+}`);
+
+// ------------- mesh (surface of revolution, rebuilt on the CPU when the shape or its vibration changes)
+const NS = 88, COLS = NS + 1, SUB = 3, CAPN = 9;
+const WALLN = (NP - 1) * SUB + 1;
+const ROWS = CAPN + WALLN + 2 + WALLN + CAPN;
+const pr = new Float64Array(ROWS), py = new Float64Array(ROWS), pnode = new Float64Array(ROWS), ps = new Float64Array(ROWS), pside = new Float64Array(ROWS), pdisp = new Float64Array(ROWS);
+const COSN = [], SINN = []; for (let n = 0; n <= 7; n++) { COSN.push(new Float64Array(COLS)); SINN.push(new Float64Array(COLS)); for (let j = 0; j < COLS; j++) { COSN[n][j] = Math.cos(n * 2 * Math.PI * j / NS); SINN[n][j] = Math.sin(n * 2 * Math.PI * j / NS); } }
+function hAt(node) { const i = Math.min(NP - 2, Math.floor(node)), u = node - i; return HT[i] * (1 - u) + HT[i + 1] * u; }
+function wallPoint(x) { // catmull-rom through the nodes, x in [0, NP-1]
+  const i = Math.min(NP - 2, Math.floor(x)), t = x - i, t2 = t * t, t3 = t2 * t;
+  const i0 = Math.max(0, i - 1), i3 = Math.min(NP - 1, i + 2);
+  const f = (p0, p1, p2, p3) => 0.5 * (2 * p1 + (-p0 + p2) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t2 + (-p0 + 3 * p1 - 3 * p2 + p3) * t3);
+  return [f(R[i0], R[i], R[i + 1], R[i3]), f(Z[i0], Z[i], Z[i + 1], Z[i3])];
+}
+function buildProfile() {
+  let q = 0; const R0 = R[0], Z0 = Z[0];
+  const put = (r, y, node, s, side, disp) => { pr[q] = r; py[q] = y; pnode[q] = node; ps[q] = s; pside[q] = side; pdisp[q] = disp; q++; };
+  for (let c = 0; c < CAPN; c++) { const ph = c / CAPN * Math.PI / 2; put(R0 * Math.sin(ph), Z0 + CAPH * Math.pow(Math.cos(ph), 0.6), 0, -1 + c / CAPN, 1, 0); }
+  const wall = []; for (let i = 0; i < WALLN; i++) wall.push(wallPoint(i / SUB));
+  const nrm = wall.map((p, i) => { const a = wall[Math.max(0, i - 1)], b = wall[Math.min(WALLN - 1, i + 1)]; const tr = b[0] - a[0], tz = b[1] - a[1], l = Math.hypot(tr, tz) || 1; return [-tz / l, tr / l]; });
+  for (let i = 0; i < WALLN; i++) { const nd = i / SUB; put(wall[i][0], wall[i][1], nd, nd / (NP - 1), 1, 1); }
+  const L = wall[WALLN - 1], nL = nrm[WALLN - 1], hL = hAt(NP - 1);
+  const Li = [L[0] - nL[0] * hL, L[1] - nL[1] * hL];
+  for (const u of [0.3, 0.7]) put(L[0] + (Li[0] - L[0]) * u, L[1] + (Li[1] - L[1]) * u - 0.014, NP - 1, 1.02, 0.8, 1);
+  for (let i = WALLN - 1; i >= 0; i--) { const nd = i / SUB, h = hAt(nd); put(wall[i][0] - nrm[i][0] * h, wall[i][1] - nrm[i][1] * h, nd, 2 - nd / (NP - 1), 0.5, 1); }
+  const ri = Math.max(0.05, R0 - hAt(0));
+  for (let c = CAPN - 1; c >= 0; c--) { const ph = c / CAPN * Math.PI / 2; put(ri * Math.sin(ph), Z0 - 0.02 + (CAPH - 0.07) * Math.pow(Math.cos(ph), 0.6), 0, 3, 0.5, 0); }
+}
+const VB = new Float32Array(ROWS * COLS * 9);
+const POS = new Float64Array(ROWS * COLS * 3);
+function makeIndex(rows) { const I = new Uint32Array((rows - 1) * NS * 6); let k = 0; for (let i = 0; i < rows - 1; i++) for (let j = 0; j < NS; j++) { const a = i * COLS + j, b = a + COLS; I[k++] = a; I[k++] = b; I[k++] = a + 1; I[k++] = a + 1; I[k++] = b; I[k++] = b + 1; } return I; }
+function makeMesh(nverts, index) {
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, nverts * 36, gl.DYNAMIC_DRAW);
+  for (let a = 0; a < 3; a++) { gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, 3, gl.FLOAT, false, 36, a * 12); }
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, index, gl.STATIC_DRAW);
+  gl.bindVertexArray(null); return { vao, vb, count: index.length };
+}
+const bellMesh = makeMesh(ROWS * COLS, makeIndex(ROWS));
+// static parts: timber headstock, iron axle, iron clapper (all revolved or boxed in model space)
+function staticMesh(pos, rows, side) {
+  const vb = new Float32Array(rows * COLS * 9); normalsInto(pos, rows, vb, () => [0, 0, side]);
+  const m = makeMesh(rows * COLS, makeIndex(rows)); gl.bindBuffer(gl.ARRAY_BUFFER, m.vb); gl.bufferSubData(gl.ARRAY_BUFFER, 0, vb); return m;
+}
+function revolvePos(P, xf) {
+  const pos = new Float64Array(P.length * COLS * 3);
+  for (let i = 0; i < P.length; i++) for (let j = 0; j < COLS; j++) { const o = (i * COLS + j) * 3; const v = xf([P[i][0] * COSN[1][j], P[i][1], P[i][0] * SINN[1][j]]); pos[o] = v[0]; pos[o + 1] = v[1]; pos[o + 2] = v[2]; }
+  return pos;
+}
+function boxMesh(x0, x1, y0, y1, z0, z1, side) {
+  const F = [[[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1],[0,0,1]], [[x1,y0,z0],[x0,y0,z0],[x0,y1,z0],[x1,y1,z0],[0,0,-1]], [[x0,y1,z1],[x1,y1,z1],[x1,y1,z0],[x0,y1,z0],[0,1,0]],
+             [[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1],[0,-1,0]], [[x1,y0,z1],[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[1,0,0]], [[x0,y0,z0],[x0,y0,z1],[x0,y1,z1],[x0,y1,z0],[-1,0,0]]];
+  const vb = new Float32Array(24 * 9), I = new Uint32Array(36); let v = 0, k = 0;
+  F.forEach((f, fi) => { for (let c = 0; c < 4; c++) { vb.set([...f[c], ...f[4], 0, 0, side], v); v += 9; } const b = fi * 4; I.set([b, b + 1, b + 2, b, b + 2, b + 3], k); k += 6; });
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, vb, gl.STATIC_DRAW);
+  for (let a = 0; a < 3; a++) { gl.enableVertexAttribArray(a); gl.vertexAttribPointer(a, 3, gl.FLOAT, false, 36, a * 12); }
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, I, gl.STATIC_DRAW); gl.bindVertexArray(null);
+  return { vao, count: 36 };
+}
+const CROWN = HANG + CAPH, AXLE_Y = CROWN + 0.2;
+const headstock = boxMesh(-0.62, 0.62, CROWN - 0.02, CROWN + 0.34, -0.19, 0.19, 0.2);
+const axle = (() => { const P = [[0, -12], [0.075, -12], [0.075, 12], [0, 12]]; return staticMesh(revolvePos(P, v => [v[1], AXLE_Y + v[0], v[2]]), P.length, 0.1); })();
+const straps = [-0.42, 0.42].map(x => boxMesh(x - 0.05, x + 0.05, CROWN - 0.035, CROWN + 0.355, -0.205, 0.205, 0.1));
+// the clapper hangs from inside the crown; its ball follows the lip as the bell is reshaped
+function clapperProfile() {
+  const cy = Math.min(HANG - 0.45, Z[NP - 1] - 0.05), P = [[0, HANG - 0.02], [0.03, HANG - 0.02], [0.028, HANG - 0.3], [0.036, cy + 0.2], [0.05, cy + 0.14]];
+  for (let i = 0; i <= 10; i++) { const a = Math.PI * (0.18 + 0.82 * i / 10); P.push([0.12 * Math.sin(a), cy + 0.12 * Math.cos(a)]); }
+  P.push([0, cy - 0.12]); return P;
+}
+const CLROWS = clapperProfile().length, clapperVB = new Float32Array(CLROWS * COLS * 9);
+const clapper = staticMesh(revolvePos(clapperProfile(), v => v), CLROWS, 0.1);
+function updateClapper() { normalsInto(revolvePos(clapperProfile(), v => v), CLROWS, clapperVB, () => [0, 0, 0.1]); gl.bindBuffer(gl.ARRAY_BUFFER, clapper.vb); gl.bufferSubData(gl.ARRAY_BUFFER, 0, clapperVB); }
+function normalsInto(pos, rows, out, aux) {
+  for (let i = 0; i < rows; i++) {
+    const ia = Math.max(0, i - 1), ib = Math.min(rows - 1, i + 1);
+    const ax = aux(i);
+    for (let j = 0; j < COLS; j++) {
+      const jl = j === 0 ? NS - 1 : j - 1, jr = j === NS ? 1 : j + 1;
+      const o = (i * COLS + j) * 3, l = (i * COLS + jl) * 3, r = (i * COLS + jr) * 3, u = (ia * COLS + j) * 3, d = (ib * COLS + j) * 3;
+      const tx = pos[r] - pos[l], ty = pos[r + 1] - pos[l + 1], tz = pos[r + 2] - pos[l + 2];
+      const sx = pos[d] - pos[u], sy = pos[d + 1] - pos[u + 1], sz = pos[d + 2] - pos[u + 2];
+      let nx = ty * sz - tz * sy, ny = tz * sx - tx * sz, nz = tx * sy - ty * sx;
+      let ln = Math.hypot(nx, ny, nz); if (ln < 1e-9) { nx = 0; ny = 1; nz = 0; ln = 1; }
+      const v = (i * COLS + j) * 9;
+      out[v] = pos[o]; out[v + 1] = pos[o + 1]; out[v + 2] = pos[o + 2];
+      out[v + 3] = nx / ln; out[v + 4] = ny / ln; out[v + 5] = nz / ln;
+      out[v + 6] = typeof ax[0] === 'number' ? ax[0] : 0; out[v + 7] = ax[1]; out[v + 8] = ax[2];
+    }
+  }
+}
+const VIS = new Float64Array(NM), rowHeat = new Float64Array(ROWS);
+const AUXROW = []; for (let i = 0; i < ROWS; i++) AUXROW.push([0, 0, 0]);
+let lastVisActive = true;
+function rebuildBell(t) {
+  buildProfile();
+  // visible (slow-motion, exaggerated) mode shapes: strongest few modes
+  let act = 0;
+  const order = [...Array(NM).keys()].sort((a, b) => env[b] - env[a]).slice(0, 6);
+  for (let k = 0; k < NM; k++) VIS[k] = 0;
+  for (const k of order) { const { n, m } = MODES[k]; VIS[k] = env[k] * 0.05 * Math.sin(2 * Math.PI * (1.7 + 0.8 * n + 1.1 * m) * t + k); act += Math.abs(VIS[k]); }
+  const fl = flash ? Math.exp(-(t - flash.t) / 0.16) * flash.v : 0;
+  for (let i = 0; i < ROWS; i++) {
+    const nd = pnode[i], ii = Math.min(NP - 2, Math.floor(nd)), u = nd - ii;
+    rowHeat[i] = heatN[ii] * (1 - u) + heatN[ii + 1] * u;
+    const wr = pdisp[i];
+    for (let j = 0; j < COLS; j++) {
+      let w = 0;
+      if (wr) for (const k of order) { if (!VIS[k]) continue; const n = MODES[k].n, ph = interpShape(shapes[k], nd / (NP - 1)); const ct = COSN[n][j] * Math.cos(n * envTheta[k]) + SINN[n][j] * Math.sin(n * envTheta[k]); w += VIS[k] * ph * ct; }
+      const r = pr[i] + w, o = (i * COLS + j) * 3;
+      POS[o] = r * COSN[1][j]; POS[o + 1] = py[i]; POS[o + 2] = r * SINN[1][j];
+    }
+  }
+  normalsInto(POS, ROWS, VB, i => { const a = AUXROW[i]; a[0] = 0; a[1] = ps[i]; a[2] = pside[i]; return a; });
+  // per-vertex heat: band where the hand is working (stronger near the fingers) + strike flash
+  for (let i = 0; i < ROWS; i++) {
+    const hb = rowHeat[i]; const fs = fl > 0.01 && pside[i] > 0.9 ? fl * Math.exp(-((((pnode[i] / (NP - 1)) - flash.s) / 0.06) ** 2)) : 0;
+    if (hb < 0.003 && fs < 0.003) continue;
+    for (let j = 0; j < COLS; j++) {
+      const th = 2 * Math.PI * j / NS;
+      const dth = Math.atan2(Math.sin(th - grab.theta), Math.cos(th - grab.theta));
+      const dthf = flash ? Math.atan2(Math.sin(th - flash.theta), Math.cos(th - flash.theta)) : 9;
+      VB[(i * COLS + j) * 9 + 6] = hb * (0.08 + 0.92 * Math.exp(-dth * dth / 0.18)) + fs * Math.exp(-dthf * dthf / 0.02) * 1.3;
+    }
+  }
+  gl.bindBuffer(gl.ARRAY_BUFFER, bellMesh.vb); gl.bufferSubData(gl.ARRAY_BUFFER, 0, VB);
+  return act;
+}
+
+// ------------- camera
+const M4 = {
+  mul(a, b) { const o = new Float64Array(16); for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) { let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s; } return o; },
+  persp(fy, as, n, f) { const t = 1 / Math.tan(fy / 2); return new Float64Array([t / as, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0]); },
+  look(e, c) { let zx = e[0] - c[0], zy = e[1] - c[1], zz = e[2] - c[2]; let l = Math.hypot(zx, zy, zz); zx /= l; zy /= l; zz /= l;
+    let xx = zz, xy = 0, xz = -zx; l = Math.hypot(xx, xz); xx /= l; xz /= l; const yx = zy * xz - zz * xy, yy = zz * xx - zx * xz, yz = zx * xy - zy * xx;
+    return new Float64Array([xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0, -(xx * e[0] + xy * e[1] + xz * e[2]), -(yx * e[0] + yy * e[1] + yz * e[2]), -(zx * e[0] + zy * e[1] + zz * e[2]), 1]); },
+  inv(m) { const a = m, o = new Float64Array(16);
+    const b00 = a[0] * a[5] - a[1] * a[4], b01 = a[0] * a[6] - a[2] * a[4], b02 = a[0] * a[7] - a[3] * a[4], b03 = a[1] * a[6] - a[2] * a[5], b04 = a[1] * a[7] - a[3] * a[5], b05 = a[2] * a[7] - a[3] * a[6];
+    const b06 = a[8] * a[13] - a[9] * a[12], b07 = a[8] * a[14] - a[10] * a[12], b08 = a[8] * a[15] - a[11] * a[12], b09 = a[9] * a[14] - a[10] * a[13], b10 = a[9] * a[15] - a[11] * a[13], b11 = a[10] * a[15] - a[11] * a[14];
+    const d = 1 / (b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06);
+    o[0] = (a[5] * b11 - a[6] * b10 + a[7] * b09) * d; o[1] = (a[2] * b10 - a[1] * b11 - a[3] * b09) * d; o[2] = (a[13] * b05 - a[14] * b04 + a[15] * b03) * d; o[3] = (a[10] * b04 - a[9] * b05 - a[11] * b03) * d;
+    o[4] = (a[6] * b08 - a[4] * b11 - a[7] * b07) * d; o[5] = (a[0] * b11 - a[2] * b08 + a[3] * b07) * d; o[6] = (a[14] * b02 - a[12] * b05 - a[15] * b01) * d; o[7] = (a[8] * b05 - a[10] * b02 + a[11] * b01) * d;
+    o[8] = (a[4] * b10 - a[5] * b08 + a[7] * b06) * d; o[9] = (a[1] * b08 - a[0] * b10 - a[3] * b06) * d; o[10] = (a[12] * b04 - a[13] * b02 + a[15] * b00) * d; o[11] = (a[9] * b02 - a[8] * b04 - a[11] * b00) * d;
+    o[12] = (a[5] * b07 - a[4] * b09 - a[6] * b06) * d; o[13] = (a[0] * b09 - a[1] * b07 + a[2] * b06) * d; o[14] = (a[13] * b01 - a[12] * b03 - a[14] * b00) * d; o[15] = (a[8] * b03 - a[9] * b01 + a[10] * b00) * d; return o; },
+  tr(m, v) { const o = [0, 0, 0, 0]; for (let r = 0; r < 4; r++) o[r] = m[r] * v[0] + m[4 + r] * v[1] + m[8 + r] * v[2] + m[12 + r] * v[3]; return o; },
+};
+let VP, IVP, MM, IMM, EYE, FOV = 30 * Math.PI / 180, HALF = 1.5, HALF_S = 0;
+const YC = 0.62, PIVOT = HANG + CAPH + 0.2;
+function camera() {
+  const asp = CW / CH;
+  // frame the bell; while a hand is on it the camera holds still so the bronze stays under the finger
+  let mr = 0; for (let j = 0; j < NP; j++) mr = Math.max(mr, R[j]);
+  const want = Math.max(1.55, 1.62 / asp, mr * 1.14 / asp, YC - Z[NP - 1] + 0.42);
+  if (!grab.on) HALF_S = HALF_S ? HALF_S + (want - HALF_S) * 0.06 : want;
+  HALF = HALF_S;
+  const dist = HALF / Math.tan(FOV / 2);
+  EYE = [0, YC - dist * 0.16, dist * 0.987];
+  const P = M4.persp(FOV, asp, 0.1, 60), V = M4.look(EYE, [0, YC + (CW < CH ? 0.1 : 0), 0]);
+  VP = M4.mul(P, V); IVP = M4.inv(VP);
+  const c = Math.cos(swayA), s = Math.sin(swayA);
+  // T(pivot) * Rz * T(-pivot)
+  MM = new Float64Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, PIVOT - PIVOT * c + 0, -PIVOT * s, 1]);
+  IMM = M4.inv(MM);
+}
+function toScreen(p) { const w = M4.tr(MM, [p[0], p[1], p[2], 1]); const c = M4.tr(VP, w); return [(c[0] / c[3] + 1) * 0.5 * CW, (1 - c[1] / c[3]) * 0.5 * CH]; }
+function rOuterAt(y) { // outer surface radius at height y (profile is monotone in y)
+  const top = Z[0] + CAPH;
+  if (y > top || y < Z[NP - 1]) return -1;
+  if (y >= Z[0]) { const u = (y - Z[0]) / CAPH; return R[0] * Math.sqrt(Math.max(0, 1 - Math.pow(u, 1 / 0.6) ** 2)); }
+  let lo = 0, hi = NP - 1; while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (Z[mid] >= y) lo = mid; else hi = mid; }
+  const u = (Z[lo] - y) / Math.max(1e-9, Z[lo] - Z[hi]); return R[lo] + (R[hi] - R[lo]) * u;
+}
+function nodeAtY(y) { if (y >= Z[0]) return 0; let lo = 0, hi = NP - 1; while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (Z[mid] >= y) lo = mid; else hi = mid; } return lo + (Z[lo] - y) / Math.max(1e-9, Z[lo] - Z[hi]); }
+function pick(x, y, tol) {
+  const nx = x / CW * 2 - 1, ny = 1 - y / CH * 2;
+  let a = M4.tr(IVP, [nx, ny, -1, 1]), b = M4.tr(IVP, [nx, ny, 1, 1]); a = a.map(v => v / a[3]); b = b.map(v => v / b[3]);
+  a = M4.tr(IMM, a); b = M4.tr(IMM, b);
+  const dir = [b[0] - a[0], b[1] - a[1], b[2] - a[2]], L = Math.hypot(...dir); dir[0] /= L; dir[1] /= L; dir[2] /= L;
+  const inside = t => { const px = a[0] + dir[0] * t, py_ = a[1] + dir[1] * t, pz = a[2] + dir[2] * t; const r = rOuterAt(py_); return r > 0 && Math.hypot(px, pz) <= r; };
+  const dc = Math.hypot(a[0], a[1] - YC, a[2]);
+  let prev = dc - 3.2, hit = -1;
+  for (let t = dc - 3.2; t < dc + 3.2; t += 0.012) { if (inside(t)) { hit = t; break; } prev = t; }
+  if (hit >= 0) {
+    let lo = prev, hi = hit; for (let i = 0; i < 14; i++) { const m = (lo + hi) / 2; if (inside(m)) hi = m; else lo = m; }
+    const px = a[0] + dir[0] * hi, pyy = a[1] + dir[1] * hi, pz = a[2] + dir[2] * hi;
+    return { sg: nodeAtY(pyy) / (NP - 1), theta: Math.atan2(pz, px), exact: true };
+  }
+  // near the silhouette: grab the nearest wall node on the left / right edge
+  let best = tol, res = null;
+  for (let j = 0; j < NP; j++) for (const sd of [1, -1]) { const p = toScreen([sd * R[j], Z[j], 0]); const d = Math.hypot(p[0] - x, p[1] - y); if (d < best) { best = d; res = { sg: j / (NP - 1), theta: sd > 0 ? 0 : Math.PI, exact: false }; } }
+  return res;
+}
+
+// ------------- input
+let lastMove = { x: 0, y: 0, t: 0, v: 0 };
+cv.addEventListener('pointermove', e => {
+  const t = performance.now(), dt = Math.max(1, t - lastMove.t);
+  const sp = Math.hypot(e.clientX - lastMove.x, e.clientY - lastMove.y) / dt * 1000;
+  lastMove.v = dt > 80 ? sp * 0.3 : lastMove.v * 0.5 + sp * 0.5; lastMove.x = e.clientX; lastMove.y = e.clientY; lastMove.t = t;
+  if (grab.on && e.pointerId === grab.id) {
+    const dx = e.clientX - grab.x0, dy = e.clientY - grab.y0;
+    if (!grab.moved && Math.hypot(dx, dy) > 4) grab.moved = true;
+    if (grab.moved) {
+      const dr = (Math.abs(e.clientX - grab.ax0) - Math.abs(grab.x0 - grab.ax0)) * grab.wpp / Math.max(0.55, Math.abs(grab.cosT));
+      applyDrag(dr, -dy * grab.wpp);
+    }
+  } else if (e.pointerType === 'mouse') {
+    cv.style.cursor = pick(e.clientX, e.clientY, 22) ? 'grab' : 'default';
+  }
+});
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  startAudio();
+  const hit = pick(e.clientX, e.clientY, e.pointerType === 'mouse' ? 22 : 40);
+  if (!hit) return;
+  const v = e.pointerType === 'mouse' ? Math.max(0.5, Math.min(1, 0.5 + (performance.now() - lastMove.t < 90 ? lastMove.v : 0) / 2600)) : 0.8;
+  strike(hit.sg, hit.theta, v);
+  if (grab.on) return;   // a second finger only strikes; the first keeps shaping
+  grab.on = true; grab.id = e.pointerId; grab.sg = hit.sg; grab.theta = hit.theta; grab.x0 = e.clientX; grab.y0 = e.clientY; grab.moved = false;
+  grab.cosT = Math.cos(hit.theta); grab.bR.set(R); grab.bZ.set(Z);
+  grab.ax0 = toScreen([0, Z[Math.round(hit.sg * (NP - 1))], 0])[0];
+  grab.wpp = 2 * HALF / CH;
+  try { cv.setPointerCapture(e.pointerId); } catch (_) {}
+  cv.style.cursor = 'grabbing';
+});
+function release(e) { if (!grab.on || (e && e.pointerId !== grab.id)) return; grab.on = false; grab.moved = false; cv.style.cursor = 'grab'; if (ac && ac.state !== 'running') ac.resume(); }
+cv.addEventListener('pointerup', release); cv.addEventListener('pointercancel', release); cv.addEventListener('lostpointercapture', release);
+cv.addEventListener('contextmenu', e => e.preventDefault());
+addEventListener('keydown', e => { if (e.key === 'r' && !grab.on) morphTo(DEF_R, DEF_Z, 1.2); });
+
+let morph = null;
+function morphTo(tR, tZ, dur) { morph = { fR: R.slice(), fZ: Z.slice(), tR: Float64Array.from(tR), tZ: Float64Array.from(tZ), t0: nowS, dur }; }
+
+// ------------- loop
+let frames = 0, fpsT = performance.now(), fps = 0, lastT = performance.now(), solveMs = 0;
+function frame() {
+  const tn = performance.now(); const dt = Math.min(0.05, (tn - lastT) / 1000); lastT = tn; nowS = (tn - t0) / 1000;
+  frames++; if (tn - fpsT > 500) { fps = frames * 1000 / (tn - fpsT); frames = 0; fpsT = tn; }
+  if (morph) { const u = Math.min(1, (nowS - morph.t0) / morph.dur), e = u * u * (3 - 2 * u); for (let j = 0; j < NP; j++) { R[j] = morph.fR[j] + (morph.tR[j] - morph.fR[j]) * e; Z[j] = morph.fZ[j] + (morph.tZ[j] - morph.fZ[j]) * e; } dirtyShape = true; if (u >= 1) morph = null; }
+  if (dirtyShape) { const s0 = performance.now(); solveModes(); solveMs = performance.now() - s0; pushFreqs(); updateClapper(); dirtyShape = false; shapeVersion++; }
+  // decay of the visual envelopes follows the audio decay
+  for (let k = 0; k < NM; k++) env[k] *= Math.exp(-6.907755 * dt / t60(freq[k]));
+  // heat
+  for (let j = 0; j < NP; j++) {
+    heatT[j] = grab.on && grab.moved ? Math.exp(-(((SS[j] - grab.sg) / 0.11) ** 2)) : 0;
+    heatN[j] += (heatT[j] - heatN[j]) * (heatT[j] > heatN[j] ? 1 - Math.exp(-dt * 4) : 1 - Math.exp(-dt * 1.8));
+  }
+  // pendulum sway
+  const w0 = 1.9; swayV += (-w0 * w0 * (swayA - 0.0035 * Math.sin(nowS * 0.37)) - 0.12 * swayV) * dt; swayA += swayV * dt;
+  camera();
+  gl.viewport(0, 0, W, H);
+  gl.disable(gl.DEPTH_TEST); gl.useProgram(BG);
+  const cs = toScreen([0, YC + 0.1, 0]);
+  gl.uniform2f(gl.getUniformLocation(BG, 'uRes'), W, H); gl.uniform2f(gl.getUniformLocation(BG, 'uC'), cs[0] / CW, 1 - cs[1] / CH); gl.uniform1f(gl.getUniformLocation(BG, 'uT'), nowS % 100);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.enable(gl.DEPTH_TEST); gl.clear(gl.DEPTH_BUFFER_BIT); gl.depthFunc(gl.LEQUAL);
+  rebuildBell(nowS);
+  gl.useProgram(BELL);
+  gl.uniformMatrix4fv(gl.getUniformLocation(BELL, 'uVP'), false, Float32Array.from(VP));
+  gl.uniformMatrix4fv(gl.getUniformLocation(BELL, 'uM'), false, Float32Array.from(MM));
+  gl.uniform3f(gl.getUniformLocation(BELL, 'uEye'), EYE[0], EYE[1], EYE[2]); gl.uniform1f(gl.getUniformLocation(BELL, 'uT'), nowS % 100);
+  for (const m of [headstock, axle, clapper, ...straps]) { gl.bindVertexArray(m.vao); gl.drawElements(gl.TRIANGLES, m.count, gl.UNSIGNED_INT, 0); }
+  gl.bindVertexArray(bellMesh.vao); gl.drawElements(gl.TRIANGLES, bellMesh.count, gl.UNSIGNED_INT, 0);
+  gl.bindVertexArray(null);
+  if (DEBUG) {
+    const f = k => freq[k].toFixed(1), rr = k => (freq[k] / freq[1]).toFixed(3);
+    dbgEl.textContent = `hum ${f(0)} prime ${f(1)} tierce ${f(3)} (${rr(3)}) quint ${f(4)} (${rr(4)}) nominal ${f(6)} (${rr(6)})  |  env ${env[6].toFixed(3)}  strikes ${strikes}  grab ${grab.on ? (grab.moved ? 'drag' : 'hold') + ' s=' + grab.sg.toFixed(2) : '-'}  solve ${solveMs.toFixed(1)}ms  ${fps.toFixed(0)}fps  audio ${audioReady ? ac.state : 'off'}`;
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ------------- test hooks
+const SHAPES = {
+  default: () => [DEF_R, DEF_Z],
+  trumpet: () => [DEF_R.map((r, j) => r * (1 + 0.75 * SS[j] ** 4) * (1 - 0.18 * Math.sin(Math.PI * SS[j]))), DEF_Z],
+  squat: () => [DEF_R.map((r, j) => r * (1.12 + 0.1 * (1 - SS[j]))), DEF_Z.map(z => HANG - (HANG - z) * 0.5)],
+  tulip: () => [DEF_R.map((r, j) => r * (1 - 0.2 * SS[j] ** 2) * (1 + 0.15 * Math.sin(Math.PI * SS[j] * 0.8))), DEF_Z.map(z => HANG - (HANG - z) * 1.45)],
+  dome: () => [DEF_R.map((r, j) => 0.35 + 1.05 * Math.sin(SS[j] * Math.PI / 2)), DEF_Z.map((z, j) => HANG - 0.55 * (1 - Math.cos(SS[j] * Math.PI / 2)) - 0.05 * SS[j])],
+};
+function renderOffline(sec, events) {
+  const sr = 44100, n = Math.floor(sec * sr), L = new Float32Array(n), Rt = new Float32Array(n);
+  const saveR = R.slice(), saveZ = Z.slice(); const d = new BellDSP(sr, NOSC); d.setPan(PAN);
+  solveModes(); d.setFreqs(oscFreqs());
+  const ev = events.slice().sort((a, b) => a.t - b.t); let ei = 0, mo = null, blk = 0;
+  for (let pos = 0; pos < n; pos += 128, blk++) {
+    const t = pos / sr;
+    while (ei < ev.length && ev[ei].t <= t) { const e = ev[ei++]; if (e.strike) { const s = strikeAmps(e.strike[0], e.strike[1], e.strike[2]); d.strike(s.a, s.noise); } if (e.morph) { const [tR, tZ] = SHAPES[e.morph](); mo = { fR: R.slice(), fZ: Z.slice(), tR, tZ, t0: t, dur: e.dur }; } }
+    if (mo && blk % 4 === 0) { const u = Math.min(1, (t - mo.t0) / mo.dur), e = u * u * (3 - 2 * u); for (let j = 0; j < NP; j++) { R[j] = mo.fR[j] + (mo.tR[j] - mo.fR[j]) * e; Z[j] = mo.fZ[j] + (mo.tZ[j] - mo.fZ[j]) * e; } solveModes(); d.setFreqs(oscFreqs()); if (u >= 1) mo = null; }
+    const len = Math.min(128, n - pos); d.render(L.subarray(pos, pos + len), Rt.subarray(pos, pos + len), len);
+  }
+  R.set(saveR); Z.set(saveZ); solveModes();
+  const mono = new Float32Array(n); for (let i = 0; i < n; i++) mono[i] = (L[i] + Rt[i]) * 0.5 * MASTER * 2; return mono;
+}
+window.__proto = {
+  get state() { return { freqs: Array.from(freq, v => +v.toFixed(2)), ratios: Array.from(freq, v => +(v / freq[1]).toFixed(3)), modes: MODES.map(m => m.n + ',' + m.m), env: Array.from(env, v => +v.toFixed(4)), R: Array.from(R, v => +v.toFixed(3)), Z: Array.from(Z, v => +v.toFixed(3)), audio: audioReady ? ac.state : 'off', strikes, grab: { ...grab, bR: undefined, bZ: undefined }, fps: +fps.toFixed(1), solveMs: +solveMs.toFixed(2) }; },
+  strike(sg = 0.9, theta = 0.4, v = 0.9) { strike(sg, theta, v); },
+  setShape(name, dur = 0) { const [tR, tZ] = SHAPES[name](); if (dur) morphTo(tR, tZ, dur); else { R.set(tR); Z.set(tZ); dirtyShape = true; } },
+  screen(sg, side = 1) { const j = Math.round(sg * (NP - 1)); return toScreen([side * R[j], Z[j], 0]); },
+  pick(x, y) { return pick(x, y, 30); },
+  renderOffline,
+  spectro(which) {
+    let x, title;
+    if (which === 'a') { x = renderOffline(6, [{ t: 0.05, strike: [0.92, 0.5, 0.9] }]); title = 'default bell, struck near lip'; }
+    else if (which === 'b') { x = renderOffline(6, [{ t: 0.05, strike: [0.92, 0.5, 0.9] }, { t: 1.2, morph: 'trumpet', dur: 1.6 }, { t: 3.4, morph: 'squat', dur: 1.4 }]); title = 'struck, then pulled into trumpet (1.2-2.8s), then squat (3.4-4.8s)'; }
+    else { x = renderOffline(6, [{ t: 0.05, strike: [0.45, 0.5, 0.9] }]); title = 'default bell, struck at waist'; }
+    return window.analyse(x, 44100, title);
+  },
+};
+})();
+</script>
+</body>
+</html>
